@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@onlyoffice/document-editor-react": "^2.3.0"
+  }
+}
