@@ -214,6 +214,13 @@ function App() {
         </button>
       </form>
 
+      <button
+        type="button"
+        onClick={() => setGeneratedFilename("resume_1.docx")}
+      >
+        Test Existing Resume
+      </button>
+
       {analysis && (
         <section className="card">
           <h2>Analysis Results</h2>

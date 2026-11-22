@@ -19,6 +19,7 @@ from backend.database.models import (
     ResumeFormatting,
     ProcessedResume
 )
+from backend.services.pdf_generator import create_resume_docx
 
 from backend.services.ri_engine import run_ri_engine
 
@@ -153,6 +154,56 @@ def analyze_resume(
         raise HTTPException(
             status_code=502,
             detail=str(error)
+        )
+
+@app.post("/resumes/{resume_id}/generate")
+def generate_resume(
+    resume_id: int,
+    db: Session = Depends(get_db)
+):
+    resume = db.query(MasterResume).filter(
+        MasterResume.id == resume_id
+    ).first()
+
+    if not resume:
+        raise HTTPException(
+            status_code=404,
+            detail="Resume not found."
+        )
+
+    processed_resume = db.query(ProcessedResume).filter(
+        ProcessedResume.resume_id == resume_id
+    ).order_by(
+        ProcessedResume.id.desc()
+    ).first()
+
+    if not processed_resume:
+        raise HTTPException(
+            status_code=404,
+            detail="No processed resume found. Analyse the job description first."
+        )
+
+    try:
+        output_path = create_resume_docx(
+            db,
+            processed_resume.id
+        )
+
+        return {
+            "processed_resume_id": processed_resume.id,
+            "filename": Path(output_path).name
+        }
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Resume generation failed: {str(error)}"
         )
 
 def remove_resumes(resumes: list, db: Session):
