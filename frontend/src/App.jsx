@@ -24,12 +24,12 @@ function Icon({ name, size = 22 }) {
     sparkles: <><path d="m12 3 1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z" /><path d="m19 14 1.1 2.9L23 18l-2.9 1.1L19 22l-1.1-2.9L15 18l2.9-1.1L19 14ZM5 2l.8 2.2L8 5l-2.2.8L5 8l-.8-2.2L2 5l2.2-.8L5 2Z" /></>,
     check: <path d="m5 12 4 4L19 6" />,
     arrow: <><path d="M5 12h14M13 6l6 6-6 6" /></>,
-    trash: <><path d="M3 6h18M8 6V4h8v2m3 0-1 14H6L5 6m4 4v6m6-6v6" /></>,
-    sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42" /></>
+    trash: <><path d="M3 6h18M8 6V4h8v2m3 0-1 14H6L5 6m4 4v6m6-6v6" /></>
   };
 
   return <svg {...common}>{paths[name]}</svg>;
 }
+
 
 function App() {
   const [masterResume, setMasterResume] = useState(null);
@@ -39,11 +39,11 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [checkingResume, setCheckingResume] = useState(true);
   const [error, setError] = useState("");
-  const [analysis, setAnalysis] = useState(null);
   const [generatedFilename, setGeneratedFilename] = useState(null);
   const [dragging, setDragging] = useState(false);
 
   const fileInputRef = useRef(null);
+
 
   useEffect(() => {
     async function fetchLatestResume() {
@@ -55,12 +55,15 @@ function App() {
             setMasterResume(null);
             return;
           }
+
           throw new Error("Failed to check for an existing resume.");
         }
 
         setMasterResume(await response.json());
+
       } catch (err) {
         setError(err.message);
+
       } finally {
         setCheckingResume(false);
       }
@@ -68,6 +71,7 @@ function App() {
 
     fetchLatestResume();
   }, []);
+
 
   function selectFile(file) {
     if (!file) return;
@@ -82,8 +86,11 @@ function App() {
     setGeneratedFilename(null);
   }
 
+
   async function uploadResume() {
-    if (!resumeFile) return masterResume?.id;
+    if (!resumeFile) {
+      return masterResume?.id;
+    }
 
     const formData = new FormData();
     formData.append("file", resumeFile);
@@ -108,10 +115,13 @@ function App() {
     return data.id;
   }
 
+
   async function handleSubmit(event) {
     event.preventDefault();
+
+    if (loading) return;
+
     setError("");
-    setAnalysis(null);
     setGeneratedFilename(null);
 
     if (!jobDescription.trim()) {
@@ -126,33 +136,60 @@ function App() {
 
     setLoading(true);
 
+    let resumeId = null;
+    let processedResumeId = null;
+
     try {
-      const resumeId = await uploadResume();
+      resumeId = await uploadResume();
 
       if (!resumeId) {
         throw new Error("Could not identify the master resume.");
       }
 
+      console.info("[ResumeBuilder] Starting JD analysis", {
+        resumeId,
+        jobDescriptionLength: jobDescription.length
+      });
+
       const analysisResponse = await fetch(
         `${API_URL}/resumes/${resumeId}/analyze`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ job_description: jobDescription })
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            job_description: jobDescription
+          })
         }
       );
 
       const analysisData = await analysisResponse.json();
 
       if (!analysisResponse.ok) {
-        throw new Error(analysisData.detail || "Resume analysis failed.");
+        throw new Error(
+          analysisData.detail || "Resume analysis failed."
+        );
       }
 
-      setAnalysis(analysisData.processed_data);
+      processedResumeId = analysisData.processed_resume_id;
+
+      if (!processedResumeId) {
+        throw new Error(
+          "The analysis response did not include a processed resume ID."
+        );
+      }
+
+      console.info("[ResumeBuilder] JD analysis completed", {
+        resumeId,
+        processedResumeId
+      });
 
       const generationResponse = await fetch(
-        `${API_URL}/resumes/${resumeId}/generate`,
-        { method: "POST" }
+        `${API_URL}/documents/generate/${processedResumeId}`,
+        {
+          method: "POST"
+        }
       );
 
       const generationData = await generationResponse.json();
@@ -163,31 +200,49 @@ function App() {
         );
       }
 
+      if (
+        generationData.processed_resume_id !== processedResumeId
+      ) {
+        throw new Error(
+          "The generated document does not match the requested analysis."
+        );
+      }
+
       if (!generationData.filename) {
         throw new Error("No generated filename was returned.");
       }
 
+      console.info("[ResumeBuilder] Document generated", {
+        resumeId,
+        processedResumeId,
+        filename: generationData.filename
+      });
+
       setGeneratedFilename(generationData.filename);
+
     } catch (err) {
+      console.error("[ResumeBuilder] Processing failed", {
+        resumeId,
+        processedResumeId,
+        error: err.message
+      });
+
       setError(err.message);
+
     } finally {
       setLoading(false);
     }
   }
 
-  if (generatedFilename) {
-    return (
-      <div className="editor-workspace">
-        <DocumentEditorComponent filename={generatedFilename} />
-      </div>
-    );
-  }
 
   return (
     <div className="app">
       <header className="topbar">
         <a className="brand" href="/" aria-label="AI Resume Builder home">
-          <span className="brand-icon"><Icon name="file" size={27} /><span>✦</span></span>
+          <span className="brand-icon">
+            <Icon name="file" size={27} />
+            <span>✦</span>
+          </span>
           <span>AI Resume <strong>Builder</strong></span>
         </a>
 
@@ -197,13 +252,25 @@ function App() {
         </div>
       </header>
 
+
       <main className="main-content">
         <section className="hero">
           <div className="hero-copy">
-            <span className="eyebrow"><Icon name="sparkles" size={15} /> YOUR NEXT OPPORTUNITY STARTS HERE</span>
-            <h1>Craft your perfect resume <span>with AI.</span></h1>
-            <p>Turn your experience into a tailored resume that speaks directly to the role you want.</p>
+            <span className="eyebrow">
+              <Icon name="sparkles" size={15} />
+              YOUR NEXT OPPORTUNITY STARTS HERE
+            </span>
+
+            <h1>
+              Craft your perfect resume <span>with AI.</span>
+            </h1>
+
+            <p>
+              Turn your experience into a tailored resume that speaks
+              directly to the role you want.
+            </p>
           </div>
+
           <div className="hero-decoration" aria-hidden="true">
             <div className="decoration-card">
               <Icon name="file" size={66} />
@@ -214,6 +281,7 @@ function App() {
           </div>
         </section>
 
+
         <div className="workspace">
           <aside className="sidebar">
             <div className="steps-card">
@@ -221,54 +289,91 @@ function App() {
 
               <div className="step active">
                 <div className="step-number">1</div>
-                <div><h3>Upload resume</h3><p>Start with your experience</p></div>
+                <div>
+                  <h3>Upload resume</h3>
+                  <p>Start with your experience</p>
+                </div>
               </div>
 
               <div className="step-line" />
 
               <div className="step">
                 <div className="step-number">2</div>
-                <div><h3>Add job description</h3><p>Tell us about your target role</p></div>
+                <div>
+                  <h3>Add job description</h3>
+                  <p>Tell us about your target role</p>
+                </div>
               </div>
 
               <div className="step-line" />
 
               <div className="step">
                 <div className="step-number">3</div>
-                <div><h3>Analyse & generate</h3><p>Build your tailored resume</p></div>
+                <div>
+                  <h3>Analyse & generate</h3>
+                  <p>Build your tailored resume</p>
+                </div>
               </div>
             </div>
 
+
             <div className="sidebar-promo">
-              <div className="promo-icon"><Icon name="sparkles" size={27} /></div>
+              <div className="promo-icon">
+                <Icon name="sparkles" size={27} />
+              </div>
+
               <h3>Make every application count.</h3>
-              <p>Highlight the experience that matters for the opportunity ahead.</p>
-              <span>Built around your experience <Icon name="arrow" size={16} /></span>
+
+              <p>
+                Highlight the experience that matters for the opportunity ahead.
+              </p>
+
+              <span>
+                Built around your experience <Icon name="arrow" size={16} />
+              </span>
             </div>
           </aside>
+
 
           <form className="form-content" onSubmit={handleSubmit}>
             <section className="card resume-card">
               <div className="card-heading">
-                <div className="heading-icon"><Icon name="upload" size={23} /></div>
+                <div className="heading-icon">
+                  <Icon name="upload" size={23} />
+                </div>
+
                 <div>
                   <h2>Your resume</h2>
-                  <p>Upload your existing resume or use your saved version.</p>
+                  <p>
+                    Upload your existing resume or use your saved version.
+                  </p>
                 </div>
               </div>
 
+
               {checkingResume ? (
-                <div className="existing-resume loading-resume">Checking for an existing resume...</div>
+                <div className="existing-resume loading-resume">
+                  Checking for an existing resume...
+                </div>
               ) : masterResume && !resumeFile ? (
                 <div className="existing-resume">
-                  <div className="file-icon"><Icon name="file" size={22} /></div>
+                  <div className="file-icon">
+                    <Icon name="file" size={22} />
+                  </div>
+
                   <div className="file-details">
-                    <strong>{masterResume.file_name || "Your saved resume"}</strong>
+                    <strong>
+                      {masterResume.file_name || "Your saved resume"}
+                    </strong>
                     <span>Existing master resume</span>
                   </div>
-                  <span className="ready-badge"><Icon name="check" size={15} /> Ready</span>
+
+                  <span className="ready-badge">
+                    <Icon name="check" size={15} /> Ready
+                  </span>
                 </div>
               ) : null}
+
 
               <div
                 className={`dropzone ${dragging ? "dragging" : ""}`}
@@ -292,56 +397,98 @@ function App() {
                   }
                 }}
               >
-                <div className="dropzone-icon"><Icon name="upload" size={30} /></div>
-                <h3>{resumeFile ? "Choose a different resume" : "Drop your resume here"}</h3>
+                <div className="dropzone-icon">
+                  <Icon name="upload" size={30} />
+                </div>
+
+                <h3>
+                  {resumeFile
+                    ? "Choose a different resume"
+                    : "Drop your resume here"}
+                </h3>
+
                 <p>or browse files from your device</p>
-                <button type="button" className="browse-button" onClick={(event) => {
-                  event.stopPropagation();
-                  fileInputRef.current?.click();
-                }}>
+
+                <button
+                  type="button"
+                  className="browse-button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    fileInputRef.current?.click();
+                  }}
+                >
                   Browse files <Icon name="arrow" size={16} />
                 </button>
-                <span className="file-hint">DOCX format · Word documents only</span>
+
+                <span className="file-hint">
+                  DOCX format · Word documents only
+                </span>
+
                 <input
                   ref={fileInputRef}
                   type="file"
                   accept=".docx"
                   hidden
-                  onChange={(event) => selectFile(event.target.files[0] || null)}
+                  onChange={(event) =>
+                    selectFile(event.target.files[0] || null)
+                  }
                 />
               </div>
 
+
               {resumeFile && (
                 <div className="existing-resume selected-file">
-                  <div className="file-icon"><Icon name="file" size={22} /></div>
+                  <div className="file-icon">
+                    <Icon name="file" size={22} />
+                  </div>
+
                   <div className="file-details">
                     <strong>{resumeFile.name}</strong>
-                    <span>{(resumeFile.size / 1024).toFixed(1)} KB · Selected file</span>
+                    <span>
+                      {(resumeFile.size / 1024).toFixed(1)} KB · Selected file
+                    </span>
                   </div>
-                  <button type="button" className="remove-file" aria-label="Remove selected file" onClick={() => setResumeFile(null)}>
+
+                  <button
+                    type="button"
+                    className="remove-file"
+                    aria-label="Remove selected file"
+                    onClick={() => setResumeFile(null)}
+                  >
                     <Icon name="trash" size={18} />
                   </button>
                 </div>
               )}
+
 
               {masterResume && (
                 <label className="replace-option">
                   <input
                     type="checkbox"
                     checked={replaceResume}
-                    onChange={(event) => setReplaceResume(event.target.checked)}
+                    onChange={(event) =>
+                      setReplaceResume(event.target.checked)
+                    }
                   />
-                  <span>Replace my existing master resume with this upload</span>
+                  <span>
+                    Replace my existing master resume with this upload
+                  </span>
                 </label>
               )}
             </section>
 
+
             <section className="card job-card">
               <div className="card-heading">
-                <div className="heading-icon"><Icon name="briefcase" size={23} /></div>
+                <div className="heading-icon">
+                  <Icon name="briefcase" size={23} />
+                </div>
+
                 <div>
                   <h2>Job description</h2>
-                  <p>Paste the job description for the role you're targeting.</p>
+                  <p>
+                    Paste the job description for the role you're targeting.
+                  </p>
                 </div>
               </div>
 
@@ -352,51 +499,62 @@ function App() {
                 rows={8}
                 maxLength={10000}
               />
+
               <div className="textarea-footer">
-                <span>Include as much detail as possible for a better match.</span>
-                <span>{jobDescription.length.toLocaleString()} / 10,000</span>
+                <span>
+                  Include as much detail as possible for a better match.
+                </span>
+
+                <span>
+                  {jobDescription.length.toLocaleString()} / 10,000
+                </span>
               </div>
             </section>
 
-            {error && <div className="error-message" role="alert">{error}</div>}
 
-            <button className="analyse-button" type="submit" disabled={loading || checkingResume}>
+            {error && (
+              <div className="error-message" role="alert">
+                {error}
+              </div>
+            )}
+
+
+            <button
+              className="analyse-button"
+              type="submit"
+              disabled={loading || checkingResume}
+            >
               {loading ? (
-                <><span className="spinner" /> Processing your resume...</>
+                <>
+                  <span className="spinner" />
+                  Processing your resume...
+                </>
               ) : (
-                <><Icon name="sparkles" size={20} /> Analyse & generate resume <Icon name="arrow" size={19} /></>
+                <>
+                  <Icon name="sparkles" size={20} />
+                  Analyse & generate resume
+                  <Icon name="arrow" size={19} />
+                </>
               )}
             </button>
 
-            <p className="privacy-note">Your resume is used to create a tailored version for your application.</p>
+            <p className="privacy-note">
+              Your resume is used to create a tailored version for your application.
+            </p>
           </form>
         </div>
-
-        {analysis && (
-          <section className="card results-card">
-            <div className="card-heading">
-              <div className="heading-icon"><Icon name="sparkles" size={23} /></div>
-              <div><h2>Analysis results</h2><p>Your resume tailoring data.</p></div>
-            </div>
-            <pre>{JSON.stringify(analysis, null, 2)}</pre>
-          </section>
-        )}
-
-        {generatedFilename && (
-          <section className="card editor-card">
-            <div className="card-heading">
-              <div className="heading-icon"><Icon name="file" size={23} /></div>
-              <div><h2>Your tailored resume</h2><p>Review and edit your generated document below.</p></div>
-            </div>
-            <DocumentEditorComponent filename={generatedFilename} />
-          </section>
-        )}
       </main>
+
 
       <footer className="footer">
         <span>AI Resume Builder</span>
         <span>Make your next move count.</span>
       </footer>
+
+
+      {generatedFilename && (
+        <DocumentEditorComponent filename={generatedFilename} />
+      )}
     </div>
   );
 }

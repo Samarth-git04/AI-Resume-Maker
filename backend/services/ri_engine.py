@@ -62,7 +62,6 @@ def _score_project(
                 continue
 
             score = float(score)
-
             current_score = requirement_scores.get(requirement_id)
 
             if current_score is None or score > current_score:
@@ -76,18 +75,13 @@ def _score_project(
         requirement_id = requirement.get("requirement_id")
         priority = requirement.get("priority", "unspecified")
 
-        weight = PROJECT_REQUIREMENT_WEIGHTS.get(
-            priority,
-            1.0,
-        )
+        weight = PROJECT_REQUIREMENT_WEIGHTS.get(priority, 1.0)
 
         if weight == 0:
             continue
 
         total_weight += weight
-
         score = requirement_scores.get(requirement_id, 0.0)
-
         weighted_score += score * weight
 
         if requirement_id in requirement_scores:
@@ -331,25 +325,6 @@ def _normalise_model_decisions(
     paragraph_lookup: dict,
     allowed_ids: set,
 ) -> dict:
-    """
-    Validate compact AI decisions keyed by paragraph ID.
-
-    Expected format:
-    {
-        "P10": {
-            "action": "keep",
-            "rewritten_text": null
-        },
-        "P11": {
-            "action": "rewrite",
-            "rewritten_text": "Rewritten paragraph"
-        }
-    }
-
-    Python supplies section names and matched requirements.
-    The AI only decides the action and rewritten text.
-    """
-
     result = {}
 
     if not isinstance(model_decisions, dict):
@@ -382,6 +357,9 @@ def _normalise_model_decisions(
 
             if rewritten is None:
                 continue
+
+        elif decision.get("rewritten_text") is not None:
+            continue
 
         result[paragraph_id] = {
             "source_paragraph_ids": [paragraph_id],
@@ -465,8 +443,8 @@ def run_ri_engine(
             "HIGHLIGHTS > KEY ACHIEVEMENTS."
         )
 
-    experience_paragraphs, company_candidates, experience_text = (
-        _experience_context(records)
+    _, company_candidates, experience_text = _experience_context(
+        records
     )
 
     achievement_id_set = set(achievement_ids)
@@ -505,26 +483,15 @@ def run_ri_engine(
             item["score"],
         )
 
-    # 2. Build AI context using only the selected projects.
+    # 2. Build AI context using the selected projects.
 
-    project_payload = []
-
-    for project in selected_projects:
-        project_payload.append({
+    project_payload = [
+        {
             "title_id": project["title_id"],
             "title": project["title"],
-            "paragraphs": [
-                {
-                    "id": paragraph_id,
-                    "text": paragraph_lookup[paragraph_id]["text"],
-                    "matched_requirements": paragraph_lookup[
-                        paragraph_id
-                    ]["matched_requirements"],
-                }
-                for paragraph_id in project["paragraph_ids"]
-                if paragraph_id != project["title_id"]
-            ],
-        })
+        }
+        for project in selected_projects
+    ]
 
     editable_payload = [
         {
@@ -569,6 +536,23 @@ def run_ri_engine(
         }
         for paragraph_id in achievement_ids
     ]
+
+    required_decision_ids = list(dict.fromkeys(
+        [item["id"] for item in editable_payload]
+        + [item["id"] for item in project_content_payload]
+    ))
+
+    if not required_decision_ids:
+        raise ValueError(
+            "No editable paragraphs were found for AI decisions."
+        )
+
+    if len(required_decision_ids) != (
+        len(editable_payload) + len(project_content_payload)
+    ):
+        raise ValueError(
+            "Duplicate paragraph IDs were found in the AI decision payload."
+        )
 
     profile_text = (
         paragraph_lookup[profile_id]["text"]
@@ -682,50 +666,72 @@ Return one JSON object with exactly these keys:
     "P5": {
       "action": "keep",
       "rewritten_text": null
-    },
-    "P6": {
-      "action": "rewrite",
-      "rewritten_text": "Rewritten paragraph"
-    },
-    "P7": {
-      "action": "remove",
-      "rewritten_text": null
     }
   },
   "changes_summary": ["short explanation"]
 }
 
-STRICT OUTPUT REQUIREMENTS
+CRITICAL PARAGRAPH ID CONTRACT
+
+The user message contains a field named required_decision_ids.
+
+It is the authoritative list of paragraph IDs requiring decisions.
+
+You MUST:
+- Return every ID in required_decision_ids.
+- Return each ID exactly once.
+- Use the exact ID as the JSON object key.
+- Never generate, rename, shorten or modify an ID.
+- Never omit an ID.
+- Never return an ID outside this list.
+
+For every ID, return exactly:
+{
+  "action": "keep",
+  "rewritten_text": null
+}
+
+Allowed actions:
+- keep: preserve the original paragraph.
+- rewrite: provide a factual rewritten paragraph.
+- remove: set rewritten_text to null.
+
+For keep and remove, rewritten_text MUST be null.
+For rewrite, rewritten_text MUST contain the complete rewritten paragraph.
+
+OTHER REQUIREMENTS
 
 - Return exactly three selected_achievements.
-- Use three distinct source paragraph IDs.
-- paragraph_decisions MUST be a JSON object keyed by paragraph ID.
-- Every editable paragraph ID supplied must appear exactly once.
-- Every supplied project description paragraph must appear exactly once.
-- Each decision must contain only action and rewritten_text.
-- Use keep, rewrite or remove as the action.
-- For keep and remove, rewritten_text must be null.
-- For rewrite, provide the rewritten text.
-- Experience bullets may be kept, rewritten or removed.
-- Do not return matched_requirements or section_name.
-- Do not return source_paragraph_ids.
-- Do not return selected_project_ids.
+- Use three distinct original achievement IDs.
+- Preserve all numerical claims.
+- Do not invent facts, tools, employers, dates or outcomes.
+- Do not merge paragraphs.
 - Do not add markdown or text outside the JSON object.
 """.strip()
 
     user_payload = {
+        "required_decision_ids": required_decision_ids,
         "job_requirements": requirements,
         "original_profile": profile_text,
         "company_candidates": company_candidates,
         "experience_text": experience_text,
-        "experience_paragraphs": experience_paragraphs,
         "key_achievements": achievement_payload,
         "editable_paragraphs": editable_payload,
         "project_groups": project_payload,
         "project_description_paragraphs": project_content_payload,
     }
 
-    # 4. Generate AI decisions.
+    # 4. Generate all decisions in ONE AI request.
+
+    logger.info(
+        "RI single request started. resume_id=%s editable=%d "
+        "project_descriptions=%d achievements=%d required_decisions=%d",
+        resume_id,
+        len(editable_payload),
+        len(project_content_payload),
+        len(achievement_payload),
+        len(required_decision_ids),
+    )
 
     response = generate_response(
         system_prompt=system_prompt,
@@ -765,11 +771,7 @@ STRICT OUTPUT REQUIREMENTS
         summary = profile_text
 
     else:
-        summary = re.sub(
-            r"\s+",
-            " ",
-            summary,
-        ).strip()
+        summary = re.sub(r"\s+", " ", summary).strip()
 
         all_source_text = " ".join(
             item["text"]
@@ -794,44 +796,50 @@ STRICT OUTPUT REQUIREMENTS
         if len(summary.split()) > 65:
             summary = profile_text
 
-    # 7. Validate compact paragraph decisions.
+    # 7. Validate all paragraph decisions.
 
-    required_decision_ids = {
-        item["id"]
-        for item in editable_payload
-    } | {
-        item["id"]
-        for item in project_content_payload
-    }
+    raw_decisions = response.get("paragraph_decisions")
+
+    if not isinstance(raw_decisions, dict):
+        raise ValueError(
+            "The AI returned paragraph decisions in an invalid format."
+        )
+
+    required_ids = set(required_decision_ids)
+    raw_ids = set(raw_decisions)
+
+    missing_ids = required_ids - raw_ids
+    unknown_ids = raw_ids - required_ids
+
+    if missing_ids or unknown_ids:
+        raise ValueError(
+            "Paragraph ID mismatch. "
+            f"Missing IDs: {sorted(missing_ids)}. "
+            f"Unknown IDs: {sorted(unknown_ids)}."
+        )
 
     model_decisions = _normalise_model_decisions(
-        response.get("paragraph_decisions"),
+        raw_decisions,
         paragraph_lookup,
-        required_decision_ids,
+        required_ids,
     )
+
+    invalid_ids = required_ids - set(model_decisions)
+
+    if invalid_ids:
+        raise ValueError(
+            "Invalid AI decisions for paragraph IDs: "
+            + ", ".join(sorted(invalid_ids))
+        )
 
     logger.info(
-        "RI decision diagnostics. required=%d raw_type=%s raw_count=%d "
-        "normalized=%d missing=%s",
-        len(required_decision_ids),
-        type(response.get("paragraph_decisions")).__name__,
-        len(response.get("paragraph_decisions", {}))
-        if isinstance(response.get("paragraph_decisions"), dict)
-        else -1,
+        "RI decision validation successful. resume_id=%s "
+        "required=%d returned=%d normalized=%d",
+        resume_id,
+        len(required_ids),
+        len(raw_ids),
         len(model_decisions),
-        sorted(required_decision_ids - set(model_decisions)),
     )
-
-    missing_decisions = (
-        required_decision_ids - set(model_decisions)
-    )
-
-    if missing_decisions:
-        raise ValueError(
-            "The AI did not return a valid decision for every supplied "
-            "editable paragraph. Missing paragraph IDs: "
-            + ", ".join(sorted(missing_decisions))
-        )
 
     # 8. Apply AI-selected achievements.
 
@@ -890,9 +898,7 @@ STRICT OUTPUT REQUIREMENTS
             or item["role"] == "project_content"
             or paragraph_id in achievement_id_set
         ):
-            decisions.append(
-                model_decisions[paragraph_id]
-            )
+            decisions.append(model_decisions[paragraph_id])
 
         else:
             decisions.append({
@@ -958,8 +964,11 @@ STRICT OUTPUT REQUIREMENTS
         len(selected_achievements),
         len([
             item
-            for item in experience_paragraphs
-            if item["role"] == "bullet"
+            for item in records
+            if (
+                item.get("section") == "EXPERIENCE"
+                and item.get("role") == "bullet"
+            )
         ]),
         sum(
             1
