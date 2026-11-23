@@ -1,8 +1,12 @@
 import json
+import logging
 import shutil
 
 from pathlib import Path
 from uuid import uuid4
+
+import faiss
+import numpy as np
 
 from fastapi import FastAPI, Depends, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,7 +23,12 @@ from backend.database.models import (
     ResumeFormatting,
     ProcessedResume
 )
-from backend.services.embeddings import CACHE_ROOT as EMBEDDINGS_CACHE_ROOT
+
+from backend.services.embeddings import (
+    CACHE_ROOT as EMBEDDINGS_CACHE_ROOT,
+    EmbeddingEngine
+)
+
 from backend.services.pdf_generator import create_resume_docx
 
 from backend.services.ri_engine import run_ri_engine
@@ -34,14 +43,20 @@ from backend.services.retrieval import (
     prepare_resume_cache,
     CACHE_ROOT
 )
-from backend.services.embeddings import EmbeddingEngine
+
 from backend.services.vector_store import VectorStore
 
 from backend.routers.document_editor import router as document_editor_router
 
 from backend.logging_config import configure_logging
 
+
 configure_logging()
+
+logger = logging.getLogger(__name__)
+
+GENERATED_DIR = Path(__file__).resolve().parent / "generated"
+
 
 class JobDescriptionRequest(BaseModel):
     job_description: str = Field(min_length=1)
@@ -53,11 +68,13 @@ app = FastAPI(
     version="0.0.1"
 )
 
+
 app.include_router(
     document_editor_router,
     prefix="/documents",
     tags=["Documents"],
 )
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -73,11 +90,14 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {"message": "AI Resume Builder API is running"}
+    return {
+        "message": "AI Resume Builder API is running"
+    }
 
 
 @app.get("/resumes/latest")
 def get_latest_resume(db: Session = Depends(get_db)):
+
     resume = db.query(MasterResume).order_by(
         MasterResume.created_at.desc()
     ).first()
@@ -92,7 +112,11 @@ def get_latest_resume(db: Session = Depends(get_db)):
 
 
 @app.get("/resumes/{resume_id}")
-def get_resume(resume_id: int, db: Session = Depends(get_db)):
+def get_resume(
+    resume_id: int,
+    db: Session = Depends(get_db)
+):
+
     resume = db.query(MasterResume).filter(
         MasterResume.id == resume_id
     ).first()
@@ -105,12 +129,14 @@ def get_resume(resume_id: int, db: Session = Depends(get_db)):
 
     return resume
 
+
 @app.post("/resumes/{resume_id}/analyze")
 def analyze_resume(
     resume_id: int,
     request: JobDescriptionRequest,
     db: Session = Depends(get_db)
 ):
+
     resume = db.query(MasterResume).filter(
         MasterResume.id == resume_id
     ).first()
@@ -122,6 +148,7 @@ def analyze_resume(
         )
 
     try:
+
         result = run_ri_engine(
             db=db,
             resume_id=resume_id,
@@ -148,22 +175,35 @@ def analyze_resume(
         }
 
     except ValueError as error:
+
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(error))
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
 
     except RuntimeError as error:
+
         db.rollback()
-        raise HTTPException(status_code=502, detail=str(error))
+
+        raise HTTPException(
+            status_code=502,
+            detail=str(error)
+        )
 
     except Exception:
+
         db.rollback()
         raise
+
 
 @app.post("/resumes/{resume_id}/generate")
 def generate_resume(
     resume_id: int,
     db: Session = Depends(get_db)
 ):
+
     resume = db.query(MasterResume).filter(
         MasterResume.id == resume_id
     ).first()
@@ -187,6 +227,7 @@ def generate_resume(
         )
 
     try:
+
         output_path = create_resume_docx(
             db,
             processed_resume.id
@@ -198,39 +239,284 @@ def generate_resume(
         }
 
     except ValueError as error:
+
         raise HTTPException(
             status_code=400,
             detail=str(error)
         )
 
     except Exception as error:
+
         raise HTTPException(
             status_code=500,
             detail=f"Resume generation failed: {str(error)}"
         )
 
-def remove_resumes(resumes: list, db: Session):
-    file_paths = [Path(resume.file_path) for resume in resumes]
-    cache_dirs = [
-        CACHE_ROOT / str(resume.id)
-        for resume in resumes
+
+def verify_resume_index(
+    resume_id: int,
+    vector_store: VectorStore
+):
+    cache_dir = CACHE_ROOT / str(resume_id)
+
+    required_files = [
+        cache_dir / "chunks.json",
+        cache_dir / "chunk_metadata.json",
+        cache_dir / "embeddings.npy",
+        cache_dir / "embeddings_metadata.json",
+        cache_dir / "faiss.index",
+        cache_dir / "index_metadata.json",
     ]
 
-    for resume in resumes:
-        db.delete(resume)
+    for path in required_files:
 
-    db.commit()
+        if not path.is_file():
+
+            raise RuntimeError(
+                f"Resume indexing incomplete: {path.name} is missing."
+            )
+
+    with (cache_dir / "chunks.json").open(
+        "r",
+        encoding="utf-8"
+    ) as file:
+
+        chunks = json.load(file)
+
+    with (cache_dir / "chunk_metadata.json").open(
+        "r",
+        encoding="utf-8"
+    ) as file:
+
+        chunk_metadata = json.load(file)
+
+    with (cache_dir / "embeddings_metadata.json").open(
+        "r",
+        encoding="utf-8"
+    ) as file:
+
+        embedding_metadata = json.load(file)
+
+    with (cache_dir / "index_metadata.json").open(
+        "r",
+        encoding="utf-8"
+    ) as file:
+
+        index_metadata = json.load(file)
+
+    embeddings = np.load(
+        cache_dir / "embeddings.npy",
+        allow_pickle=False
+    )
+
+    if not isinstance(chunks, list) or not chunks:
+
+        raise RuntimeError(
+            "Resume indexing produced no valid chunks."
+        )
+
+    if embeddings.ndim != 2 or not np.isfinite(embeddings).all():
+
+        raise RuntimeError(
+            "Resume embeddings are invalid."
+        )
+
+    if len(chunks) != len(embeddings):
+
+        raise RuntimeError(
+            "Embedding and chunk counts do not match."
+        )
+
+    if (
+        chunk_metadata.get("resume_id") != resume_id
+        or chunk_metadata.get("chunk_count") != len(chunks)
+    ):
+
+        raise RuntimeError(
+            "Chunk metadata validation failed."
+        )
+
+    if (
+        embedding_metadata.get("resume_id") != resume_id
+        or embedding_metadata.get("embedding_count") != len(embeddings)
+        or embedding_metadata.get("dimensions") != embeddings.shape[1]
+    ):
+
+        raise RuntimeError(
+            "Embedding metadata validation failed."
+        )
+
+    if (
+        index_metadata.get("resume_id") != resume_id
+        or index_metadata.get("vector_count") != len(chunks)
+        or index_metadata.get("dimensions") != embeddings.shape[1]
+    ):
+
+        raise RuntimeError(
+            "FAISS index metadata validation failed."
+        )
+
+    try:
+
+        disk_index = faiss.read_index(
+            str(cache_dir / "faiss.index")
+        )
+
+    except Exception as error:
+
+        raise RuntimeError(
+            "The saved FAISS index could not be loaded."
+        ) from error
+
+    if (
+        disk_index.ntotal != len(chunks)
+        or disk_index.d != embeddings.shape[1]
+        or not isinstance(disk_index, faiss.IndexFlatIP)
+    ):
+
+        raise RuntimeError(
+            "The saved FAISS index is inconsistent with its embeddings."
+        )
+
+    if (
+        vector_store.index is None
+        or vector_store.chunks is None
+        or vector_store.index.ntotal != len(chunks)
+    ):
+
+        raise RuntimeError(
+            "The in-memory FAISS index is not ready."
+        )
+
+    test_results = vector_store.search(
+        embeddings[0],
+        top_k=1
+    )
+
+    if not test_results:
+
+        raise RuntimeError(
+            "FAISS retrieval verification failed."
+        )
+
+    logger.info(
+        "Resume RAG verification successful. resume_id=%s chunks=%s vectors=%s",
+        resume_id,
+        len(chunks),
+        disk_index.ntotal
+    )
+
+    return True
+
+
+def remove_resumes(
+    resumes: list,
+    db: Session
+):
+    if not resumes:
+        return
+
+    file_paths = []
+    cache_dirs = []
+    generated_files = []
+
+    for resume in resumes:
+
+        file_paths.append(
+            Path(resume.file_path)
+        )
+
+        cache_dirs.append(
+            CACHE_ROOT / str(resume.id)
+        )
+
+        processed_records = db.query(ProcessedResume).filter(
+            ProcessedResume.resume_id == resume.id
+        ).all()
+
+        for processed_record in processed_records:
+
+            generated_files.append(
+                GENERATED_DIR / f"resume_{processed_record.id}.docx"
+            )
+
+            generated_files.append(
+                GENERATED_DIR / f"resume_{processed_record.id}.pdf"
+            )
+
+    try:
+
+        for resume in resumes:
+            db.delete(resume)
+
+        db.commit()
+
+    except Exception:
+
+        db.rollback()
+
+        logger.exception(
+            "Database cleanup failed. Old resume files were retained."
+        )
+
+        raise
 
     for file_path in file_paths:
-        file_path.unlink(missing_ok=True)
+
+        try:
+
+            file_path.unlink(missing_ok=True)
+
+        except OSError:
+
+            logger.exception(
+                "Could not delete original resume file: %s",
+                file_path
+            )
 
     for cache_dir in cache_dirs:
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir)
+
+        try:
+
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+
+        except OSError:
+
+            logger.exception(
+                "Could not delete RAG storage directory: %s",
+                cache_dir
+            )
+
+    for generated_file in generated_files:
+
+        try:
+
+            generated_file.unlink(missing_ok=True)
+
+        except OSError:
+
+            logger.exception(
+                "Could not delete generated resume file: %s",
+                generated_file
+            )
+
+    logger.info(
+        "Old resume cleanup completed. Deleted resume IDs: %s",
+        [resume.id for resume in resumes]
+    )
 
 
-def remove_resume(resume: MasterResume, db: Session):
-    remove_resumes([resume], db)
+def remove_resume(
+    resume: MasterResume,
+    db: Session
+):
+
+    remove_resumes(
+        [resume],
+        db
+    )
+
 
 @app.post("/resumes/upload")
 def upload_resume(
@@ -238,9 +524,13 @@ def upload_resume(
     replace: bool = False,
     db: Session = Depends(get_db)
 ):
-    original_filename = Path(file.filename or "").name
+
+    original_filename = Path(
+        file.filename or ""
+    ).name
 
     if Path(original_filename).suffix.lower() != ".docx":
+
         raise HTTPException(
             status_code=400,
             detail="Only DOCX files are currently supported"
@@ -253,22 +543,37 @@ def upload_resume(
     ).all()
 
     if existing_resumes and not replace:
+
         return serialize_master_resume(
-            max(existing_resumes, key=lambda resume: resume.created_at)
+            max(
+                existing_resumes,
+                key=lambda resume: resume.created_at
+            )
         )
 
     upload_dir = Path("backend/uploads")
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    upload_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     stored_filename = f"{uuid4().hex}.docx"
-    file_path = (upload_dir / stored_filename).resolve()
+
+    file_path = (
+        upload_dir / stored_filename
+    ).resolve()
 
     cache_dir = None
 
     with file_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+
+        shutil.copyfileobj(
+            file.file,
+            buffer
+        )
 
     try:
+
         db_resume = MasterResume(
             user_id=user_id,
             file_name=original_filename,
@@ -278,7 +583,15 @@ def upload_resume(
         db.add(db_resume)
         db.flush()
 
-        paragraphs = extract_docx_paragraphs(str(file_path))
+        paragraphs = extract_docx_paragraphs(
+            str(file_path)
+        )
+
+        if not paragraphs:
+
+            raise ValueError(
+                "No paragraphs could be extracted from the uploaded resume."
+            )
 
         extracted_text = "\n".join(
             paragraph["text"]
@@ -291,7 +604,9 @@ def upload_resume(
         )
 
         formatting_data = remove_nulls(
-            extract_docx_formatting(str(file_path))
+            extract_docx_formatting(
+                str(file_path)
+            )
         )
 
         db_extracted = ExtractedResume(
@@ -319,6 +634,12 @@ def upload_resume(
             db_resume.id
         )
 
+        if not cache_result.get("chunks"):
+
+            raise RuntimeError(
+                "RAG chunk generation failed."
+            )
+
         embedding_engine = EmbeddingEngine()
 
         embeddings = embedding_engine.generate_embeddings(
@@ -326,65 +647,133 @@ def upload_resume(
             cache_result["chunks"]
         )
 
-        print("Generated shape:", embeddings.shape)
-        print("Embedding cache root:", EMBEDDINGS_CACHE_ROOT)
-        print("Vector store cache root:", CACHE_ROOT)
-        print("Embedding file:", EMBEDDINGS_CACHE_ROOT / str(db_resume.id) / "embeddings.npy")
-        print("Embedding file exists:", (EMBEDDINGS_CACHE_ROOT / str(db_resume.id) / "embeddings.npy").exists())
+        if (
+            embeddings is None
+            or embeddings.ndim != 2
+            or len(embeddings) != len(cache_result["chunks"])
+        ):
 
-        vector_store = VectorStore(db_resume.id)
+            raise RuntimeError(
+                "Resume embedding generation failed."
+            )
+
+        logger.info(
+            "Generated embeddings. resume_id=%s shape=%s",
+            db_resume.id,
+            embeddings.shape
+        )
+
+        logger.info(
+            "Embedding cache root: %s",
+            EMBEDDINGS_CACHE_ROOT
+        )
+
+        logger.info(
+            "Vector store cache root: %s",
+            CACHE_ROOT
+        )
+
+        vector_store = VectorStore(
+            db_resume.id
+        )
+
         vector_store.prepare()
+
+        verify_resume_index(
+            db_resume.id,
+            vector_store
+        )
 
         db.commit()
         db.refresh(db_resume)
 
+        logger.info(
+            "New resume successfully committed. resume_id=%s",
+            db_resume.id
+        )
+
     except Exception:
+
         db.rollback()
-        file_path.unlink(missing_ok=True)
+
+        file_path.unlink(
+            missing_ok=True
+        )
 
         if cache_dir and cache_dir.exists():
-            shutil.rmtree(cache_dir)
 
-        raise
+            shutil.rmtree(
+                cache_dir,
+                ignore_errors=True
+            )
+
+        logger.exception(
+            "New resume upload or RAG indexing failed. Existing resumes were retained."
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Resume upload or indexing failed. The previous resume has been retained."
+        )
 
     if existing_resumes:
-        remove_resumes(existing_resumes, db)
 
-    return serialize_master_resume(db_resume)
+        remove_resumes(
+            existing_resumes,
+            db
+        )
+
+    return serialize_master_resume(
+        db_resume
+    )
+
 
 @app.delete("/resumes/{resume_id}")
 def delete_resume(
     resume_id: int,
     db: Session = Depends(get_db)
 ):
+
     resume = db.query(MasterResume).filter(
         MasterResume.id == resume_id
     ).first()
 
     if not resume:
+
         raise HTTPException(
             status_code=404,
             detail="Resume not found"
         )
 
-    remove_resume(resume, db)
+    remove_resume(
+        resume,
+        db
+    )
 
-    return {"message": "Resume deleted successfully"}
+    return {
+        "message": "Resume deleted successfully"
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "Healthy"}
+
+    return {
+        "status": "Healthy"
+    }
 
 
 @app.get("/api/health")
 def api_health():
+
     return {
         "status": "connected",
         "message": "Frontend and backend are now connected"
     }
 
+
 def serialize_master_resume(resume):
+
     return {
         "user_id": resume.user_id,
         "id": resume.id,
