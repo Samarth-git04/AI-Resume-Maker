@@ -6,7 +6,7 @@ from pathlib import Path
 
 from docx import Document
 from docx.oxml.ns import qn
-from docx.text.paragraph import Paragraph
+from docx.shared import Pt
 from docx.table import _Cell
 
 from backend.database.models import (
@@ -30,6 +30,9 @@ from backend.services.resume_text import (
 
 
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "generated"
+
+ACHIEVEMENT_FONT_SIZE = 10
+ACHIEVEMENT_HEADING_FONT_SIZE = 10.5
 
 
 TECHNOLOGY_TERMS = (
@@ -323,6 +326,13 @@ def _base_run_properties(paragraph):
     return None
 
 
+def _clear_paragraph_runs(paragraph):
+
+    for child in list(paragraph._p):
+        if child.tag != qn("w:pPr"):
+            paragraph._p.remove(child)
+
+
 def _append_styled_run(
     paragraph,
     text,
@@ -331,7 +341,7 @@ def _append_styled_run(
 ):
 
     if not text:
-        return
+        return None
 
     run = paragraph.add_run(text)
 
@@ -341,8 +351,9 @@ def _append_styled_run(
             deepcopy(base_properties),
         )
 
-    if bold:
-        run.bold = True
+    run.bold = bold
+
+    return run
 
 
 def _replace_paragraph_text(
@@ -359,9 +370,7 @@ def _replace_paragraph_text(
 
     # Preserve paragraph properties, including style,
     # alignment, indentation, spacing and numbering.
-    for child in list(paragraph._p):
-        if child.tag != qn("w:pPr"):
-            paragraph._p.remove(child)
+    _clear_paragraph_runs(paragraph)
 
     if not text:
         return
@@ -412,6 +421,127 @@ def _replace_paragraph_text(
             text[cursor:],
             base_properties,
         )
+
+
+def _achievement_parts(
+    original_text,
+    rewritten_text,
+):
+    """
+    Use the employer prefix from the original achievement.
+
+    This prevents an AI-generated employer name containing
+    a location from appearing in the final resume.
+    """
+
+    original_match = re.match(
+        r"^\s*([^:]{1,80}?)\s*:\s*(.*)$",
+        clean_resume_text(original_text),
+    )
+
+    rewritten_match = re.match(
+        r"^\s*([^:]{1,100}?)\s*:\s*(.*)$",
+        clean_resume_text(rewritten_text),
+    )
+
+    if original_match:
+        company = clean_resume_text(
+            original_match.group(1)
+        )
+
+        if rewritten_match:
+            body = clean_resume_text(
+                rewritten_match.group(2)
+            )
+        else:
+            body = clean_resume_text(
+                rewritten_text
+            )
+
+        return company, body
+
+    if rewritten_match:
+        return (
+            clean_resume_text(rewritten_match.group(1)),
+            clean_resume_text(rewritten_match.group(2)),
+        )
+
+    return "", clean_resume_text(rewritten_text)
+
+
+def _replace_achievement_text(
+    paragraph,
+    original_text,
+    rewritten_text,
+):
+    """
+    Render an achievement using two separate runs:
+
+    - Employer name: bold.
+    - Achievement statement: regular weight.
+
+    Technology highlighting is deliberately disabled here.
+    """
+
+    company, body = _achievement_parts(
+        original_text,
+        rewritten_text,
+    )
+
+    base_properties = _base_run_properties(
+        paragraph
+    )
+
+    _clear_paragraph_runs(paragraph)
+
+    if company:
+        company_run = _append_styled_run(
+            paragraph,
+            f"{company}: ",
+            base_properties,
+            bold=True,
+        )
+
+        company_run.font.size = Pt(
+            ACHIEVEMENT_FONT_SIZE
+        )
+
+    if body:
+        body_run = _append_styled_run(
+            paragraph,
+            body,
+            base_properties,
+            bold=False,
+        )
+
+        body_run.font.size = Pt(
+            ACHIEVEMENT_FONT_SIZE
+        )
+
+
+def _format_key_achievements_heading(paragraph):
+
+    base_properties = _base_run_properties(
+        paragraph
+    )
+
+    _clear_paragraph_runs(paragraph)
+
+    heading_run = _append_styled_run(
+        paragraph,
+        "Key Achievements",
+        base_properties,
+        bold=True,
+    )
+
+    heading_run.font.size = Pt(
+        ACHIEVEMENT_HEADING_FONT_SIZE
+    )
+
+    paragraph.paragraph_format.space_before = Pt(5)
+    paragraph.paragraph_format.space_after = Pt(2)
+    paragraph.paragraph_format.keep_with_next = True
+    paragraph.paragraph_format.line_spacing = 1.0
 
 
 def _remove_paragraph(paragraph):
@@ -558,7 +688,14 @@ def create_resume_docx(
 
     selected_projects = _selected_project_ids(
         processed_data,
-        structure,
+        structure
+    )
+
+    selected_achievement_ids = set(
+        processed_data.get(
+            "selected_achievement_ids",
+            [],
+        )
     )
 
     project_membership = {}
@@ -656,6 +793,17 @@ def create_resume_docx(
             _remove_paragraph(paragraph)
             continue
 
+        # Format the Key Achievements subsection heading.
+        if (
+            current_section == "HIGHLIGHTS"
+            and role == "subheading"
+            and clean_heading(original_text) == "KEY ACHIEVEMENTS"
+        ):
+            _format_key_achievements_heading(
+                paragraph
+            )
+            continue
+
         # Prevent duplicate summaries in HIGHLIGHTS.
         if (
             current_section == "HIGHLIGHTS"
@@ -718,6 +866,18 @@ def create_resume_docx(
         else:
             text = original_text
 
+        # Render selected Key Achievements separately.
+        if (
+            current_section == "HIGHLIGHTS"
+            and paragraph_id in selected_achievement_ids
+        ):
+            _replace_achievement_text(
+                paragraph,
+                original_text,
+                text,
+            )
+            continue
+
         # Renumber selected projects sequentially.
         if role == "project_title":
             project_number += 1
@@ -734,7 +894,7 @@ def create_resume_docx(
         )
 
         # Preserve original run formatting while highlighting
-        # technology terms in bullet points.
+        # technology terms in other bullet points.
         should_highlight = is_bullet
 
         if text != clean_resume_text(paragraph.text):

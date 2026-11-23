@@ -46,17 +46,6 @@ def _score_project(
     paragraph_lookup: dict,
     requirements: list,
 ) -> float:
-    """
-    Score a project using its best FAISS similarity score for each
-    job requirement.
-
-    Required requirements receive the highest weight. Preferred
-    requirements receive a lower weight. Not-required requirements
-    do not contribute to the score.
-
-    Missing requirement matches receive a score of zero.
-    """
-
     requirement_scores = {}
 
     for paragraph_id in project["paragraph_ids"]:
@@ -110,8 +99,6 @@ def _score_project(
     average_similarity = weighted_score / total_weight
     requirement_coverage = covered_weight / total_weight
 
-    # Similarity determines relevance. Coverage rewards projects
-    # that match a wider range of JD requirements.
     return average_similarity + (0.10 * requirement_coverage)
 
 
@@ -120,13 +107,6 @@ def _rank_projects(
     paragraph_lookup: dict,
     requirements: list,
 ) -> list:
-    """
-    Rank projects deterministically.
-
-    The AI receives only the three highest-ranked projects.
-    Ties are resolved using the original project title ID.
-    """
-
     ranked = []
 
     for project in projects:
@@ -296,13 +276,6 @@ def _normalise_achievements(
     company_candidates: list,
     experience_text: str,
 ) -> list:
-    """
-    Validate the three achievements selected by the AI.
-
-    There is intentionally no Python fallback. The AI must select
-    three distinct source achievements and provide supported employers.
-    """
-
     if not isinstance(proposed, list) or len(proposed) != 3:
         return []
 
@@ -355,61 +328,51 @@ def _normalise_achievements(
 
 def _normalise_model_decisions(
     model_decisions: Any,
-    records: list,
     paragraph_lookup: dict,
-    requirements: list,
     allowed_ids: set,
 ) -> dict:
     """
-    Validate AI decisions.
+    Validate compact AI decisions keyed by paragraph ID.
 
-    The AI may keep, rewrite or remove supplied paragraphs.
-    Experience bullets are no longer protected from removal.
-    """
-
-    requirement_ids = {
-        item["requirement_id"]
-        for item in requirements
+    Expected format:
+    {
+        "P10": {
+            "action": "keep",
+            "rewritten_text": null
+        },
+        "P11": {
+            "action": "rewrite",
+            "rewritten_text": "Rewritten paragraph"
+        }
     }
+
+    Python supplies section names and matched requirements.
+    The AI only decides the action and rewritten text.
+    """
 
     result = {}
 
-    if not isinstance(model_decisions, list):
+    if not isinstance(model_decisions, dict):
         return result
 
-    for decision in model_decisions:
-        if not isinstance(decision, dict):
-            continue
-
-        ids = decision.get("source_paragraph_ids")
-
-        if not isinstance(ids, list) or len(ids) != 1:
-            continue
-
-        paragraph_id = ids[0]
-
+    for paragraph_id, decision in model_decisions.items():
         if (
             paragraph_id not in allowed_ids
-            or paragraph_id in result
+            or not isinstance(decision, dict)
         ):
             continue
 
-        source = paragraph_lookup[paragraph_id]
+        source = paragraph_lookup.get(paragraph_id)
+
+        if not source:
+            continue
+
         action = decision.get("action")
 
         if action not in {"keep", "rewrite", "remove"}:
             continue
 
-        matched = decision.get("matched_requirements", [])
-
-        if not isinstance(matched, list):
-            matched = []
-
-        matched = [
-            item
-            for item in matched
-            if item in requirement_ids
-        ]
+        rewritten = None
 
         if action == "rewrite":
             rewritten = _safe_rewrite(
@@ -420,15 +383,17 @@ def _normalise_model_decisions(
             if rewritten is None:
                 continue
 
-        else:
-            rewritten = None
-
         result[paragraph_id] = {
             "source_paragraph_ids": [paragraph_id],
             "action": action,
             "section_name": source.get("section"),
             "rewritten_text": rewritten,
-            "matched_requirements": matched,
+            "matched_requirements": [
+                match["requirement_id"]
+                for match in source.get("matched_requirements", [])
+                if isinstance(match, dict)
+                and "requirement_id" in match
+            ],
         }
 
     return result
@@ -506,9 +471,7 @@ def run_ri_engine(
 
     achievement_id_set = set(achievement_ids)
 
-    # ---------------------------------------------------------
     # 1. Score projects in Python and select the top three.
-    # ---------------------------------------------------------
 
     ranked_projects = _rank_projects(
         projects,
@@ -542,9 +505,7 @@ def run_ri_engine(
             item["score"],
         )
 
-    # ---------------------------------------------------------
     # 2. Build AI context using only the selected projects.
-    # ---------------------------------------------------------
 
     project_payload = []
 
@@ -582,8 +543,6 @@ def run_ri_engine(
         )
     ]
 
-    # Only descriptions belonging to the selected three projects
-    # are supplied for AI editing.
     project_content_payload = [
         {
             "id": item["id"],
@@ -617,9 +576,7 @@ def run_ri_engine(
         else ""
     )
 
-    # ---------------------------------------------------------
     # 3. AI instructions.
-    # ---------------------------------------------------------
 
     system_prompt = """
 You are a professional resume editor.
@@ -627,8 +584,8 @@ You are a professional resume editor.
 The supplied resume is the only source of candidate facts.
 The supplied job description determines relevance and priority.
 
-IMPORTANT: Do not invent facts, experience, employers, dates,
-qualifications, tools, metrics, responsibilities or outcomes.
+Do not invent facts, experience, employers, dates, qualifications,
+tools, metrics, responsibilities or outcomes.
 
 TASK 1 - PROFESSIONAL SUMMARY
 
@@ -642,14 +599,8 @@ TASK 2 - KEY ACHIEVEMENTS
 
 Select EXACTLY THREE achievements from key_achievements.
 
-You must make the selection yourself based on relevance to the
-job description.
-
+Select them based on relevance to the job description.
 Do not select achievements based on their order in the resume.
-Prioritise achievements that demonstrate the most relevant skills,
-responsibilities, technical capabilities and outcomes.
-
-Do not invent or combine separate achievements.
 
 For each selected achievement:
 - Return its original source paragraph ID.
@@ -666,24 +617,16 @@ Use a company name from company_candidates or an employer name
 explicitly present in experience_text.
 
 Never use a job title as the company name.
-
-You must return three different source paragraph IDs.
+Return three different source paragraph IDs.
 
 TASK 3 - EXPERIENCE BULLETS
 
 Review every supplied experience paragraph against the job description.
 
-You may:
-- Keep a bullet unchanged.
-- Rewrite a bullet to improve relevance, clarity or impact.
-- Remove a bullet if it is irrelevant, weak, repetitive or does
-  not meaningfully support the target role.
+You may keep, rewrite or remove each paragraph.
 
-Do NOT automatically retain every bullet.
-
+Do not automatically retain every bullet.
 Actively remove bullets that add little value for this particular JD.
-Prioritise the strongest and most relevant responsibilities,
-technical work and outcomes.
 
 Do not remove every bullet belonging to an employer. Retain at least
 the strongest relevant point for each employer where possible.
@@ -697,18 +640,9 @@ selected by Python using JD relevance scores.
 
 You must NOT select different projects.
 
-Rewrite or remove project description paragraphs where doing so
-improves relevance to the JD.
-
-You may:
-- Keep a project paragraph unchanged.
-- Rewrite a project paragraph.
-- Remove an irrelevant or repetitive project bullet.
+You may keep, rewrite or remove each supplied project description.
 
 Do not invent project details, technologies, metrics or outcomes.
-
-Every project description paragraph supplied must receive exactly
-one decision.
 
 TASK 5 - OTHER EDITABLE PARAGRAPHS
 
@@ -720,7 +654,7 @@ for the target job.
 Do not remove factual information simply because it is not an exact
 keyword match.
 
-TASK 6 - FACTUAL AND FORMATTING RULES
+TASK 6 - FACTUAL RULES
 
 - Preserve technical detail and all numerical claims.
 - Never add new numbers, dates, percentages or quantities.
@@ -730,8 +664,8 @@ TASK 6 - FACTUAL AND FORMATTING RULES
   or dates.
 - Do not merge paragraphs.
 - Do not return decisions for paragraph IDs that were not supplied.
-- Use one source paragraph ID per decision.
-- Do not return section_name.
+
+OUTPUT FORMAT
 
 Return one JSON object with exactly these keys:
 
@@ -744,14 +678,20 @@ Return one JSON object with exactly these keys:
       "what_i_did": "Factual achievement statement"
     }
   ],
-  "paragraph_decisions": [
-    {
-      "source_paragraph_ids": ["P5"],
+  "paragraph_decisions": {
+    "P5": {
       "action": "keep",
-      "rewritten_text": null,
-      "matched_requirements": ["R001"]
+      "rewritten_text": null
+    },
+    "P6": {
+      "action": "rewrite",
+      "rewritten_text": "Rewritten paragraph"
+    },
+    "P7": {
+      "action": "remove",
+      "rewritten_text": null
     }
-  ],
+  },
   "changes_summary": ["short explanation"]
 }
 
@@ -759,14 +699,17 @@ STRICT OUTPUT REQUIREMENTS
 
 - Return exactly three selected_achievements.
 - Use three distinct source paragraph IDs.
-- Every editable paragraph ID supplied must have exactly one decision.
-- Every project description paragraph supplied must have exactly one decision.
-- Use one source paragraph ID per decision.
+- paragraph_decisions MUST be a JSON object keyed by paragraph ID.
+- Every editable paragraph ID supplied must appear exactly once.
+- Every supplied project description paragraph must appear exactly once.
+- Each decision must contain only action and rewritten_text.
+- Use keep, rewrite or remove as the action.
 - For keep and remove, rewritten_text must be null.
 - For rewrite, provide the rewritten text.
-- For experience bullets, keep, rewrite and remove are all allowed.
-- Do not return selected_project_ids. Python has already selected
-  the projects.
+- Experience bullets may be kept, rewritten or removed.
+- Do not return matched_requirements or section_name.
+- Do not return source_paragraph_ids.
+- Do not return selected_project_ids.
 - Do not add markdown or text outside the JSON object.
 """.strip()
 
@@ -782,9 +725,7 @@ STRICT OUTPUT REQUIREMENTS
         "project_description_paragraphs": project_content_payload,
     }
 
-    # ---------------------------------------------------------
     # 4. Generate AI decisions.
-    # ---------------------------------------------------------
 
     response = generate_response(
         system_prompt=system_prompt,
@@ -799,9 +740,7 @@ STRICT OUTPUT REQUIREMENTS
             "The resume editor returned an invalid response."
         )
 
-    # ---------------------------------------------------------
     # 5. Validate AI-selected achievements.
-    # ---------------------------------------------------------
 
     selected_achievements = _normalise_achievements(
         response.get("selected_achievements"),
@@ -818,9 +757,7 @@ STRICT OUTPUT REQUIREMENTS
             "achievement and use an employer supported by the resume."
         )
 
-    # ---------------------------------------------------------
     # 6. Validate the professional summary.
-    # ---------------------------------------------------------
 
     summary = response.get("professional_summary")
 
@@ -857,9 +794,7 @@ STRICT OUTPUT REQUIREMENTS
         if len(summary.split()) > 65:
             summary = profile_text
 
-    # ---------------------------------------------------------
-    # 7. Validate paragraph decisions.
-    # ---------------------------------------------------------
+    # 7. Validate compact paragraph decisions.
 
     required_decision_ids = {
         item["id"]
@@ -871,10 +806,20 @@ STRICT OUTPUT REQUIREMENTS
 
     model_decisions = _normalise_model_decisions(
         response.get("paragraph_decisions"),
-        records,
         paragraph_lookup,
-        requirements,
         required_decision_ids,
+    )
+
+    logger.info(
+        "RI decision diagnostics. required=%d raw_type=%s raw_count=%d "
+        "normalized=%d missing=%s",
+        len(required_decision_ids),
+        type(response.get("paragraph_decisions")).__name__,
+        len(response.get("paragraph_decisions", {}))
+        if isinstance(response.get("paragraph_decisions"), dict)
+        else -1,
+        len(model_decisions),
+        sorted(required_decision_ids - set(model_decisions)),
     )
 
     missing_decisions = (
@@ -888,9 +833,7 @@ STRICT OUTPUT REQUIREMENTS
             + ", ".join(sorted(missing_decisions))
         )
 
-    # ---------------------------------------------------------
     # 8. Apply AI-selected achievements.
-    # ---------------------------------------------------------
 
     achievement_lookup = {
         item["source_paragraph_id"]: item["text"]
@@ -932,9 +875,7 @@ STRICT OUTPUT REQUIREMENTS
                 "matched_requirements": [],
             }
 
-    # ---------------------------------------------------------
     # 9. Build final paragraph decisions.
-    # ---------------------------------------------------------
 
     decisions = []
 
@@ -968,9 +909,7 @@ STRICT OUTPUT REQUIREMENTS
                 ],
             })
 
-    # ---------------------------------------------------------
     # 10. Validate final paragraph mapping.
-    # ---------------------------------------------------------
 
     expected_ids = {
         item["id"]
@@ -995,9 +934,7 @@ STRICT OUTPUT REQUIREMENTS
             "Internal resume decision validation failed."
         )
 
-    # ---------------------------------------------------------
     # 11. Clean changes summary.
-    # ---------------------------------------------------------
 
     changes = response.get("changes_summary", [])
 
