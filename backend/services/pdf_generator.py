@@ -1,6 +1,7 @@
 import json
 import re
 import subprocess
+
 from copy import deepcopy
 from pathlib import Path
 
@@ -17,12 +18,10 @@ from backend.database.models import (
 )
 
 from backend.services.resume_ext import iter_paragraphs
-
 from backend.services.resume_structure import (
     build_resume_structure,
     clean_heading,
 )
-
 from backend.services.resume_text import (
     clean_resume_text,
     comparison_text,
@@ -31,290 +30,102 @@ from backend.services.resume_text import (
 
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "generated"
 
-ACHIEVEMENT_FONT_SIZE = 10
-ACHIEVEMENT_HEADING_FONT_SIZE = 10.5
-
-
-TECHNOLOGY_TERMS = (
-    "scikit-learn",
-    "TensorFlow",
-    "PyTorch",
-    "Power BI",
-    "Power Query",
-    "PowerPoint",
-    "JavaScript",
-    "TypeScript",
-    "Node.js",
-    "Next.js",
-    "React",
-    "FastAPI",
-    "LangGraph",
-    "LangChain",
-    "PostgreSQL",
-    "SQL Server",
-    "SQLite",
-    "BigQuery",
-    "Databricks",
-    "Snowflake",
-    "Supabase",
-    "MongoDB",
-    "Microsoft Excel",
-    "Google Cloud Platform",
-    "Google Cloud",
-    "Amazon Web Services",
-    "GitHub",
-    "Docker",
-    "Kubernetes",
-    "Airflow",
-    "dbt",
-    "Tableau",
-    "Looker",
-    "Matplotlib",
-    "Plotly",
-    "Pandas",
-    "NumPy",
-    "SciPy",
-    "XGBoost",
-    "CatBoost",
-    "Random Forest",
-    "Geant4",
-    "Groq API",
-    "Python",
-    "Java",
-    "C++",
-    "C#",
-    "SQL",
-    "NoSQL",
-    "Excel",
-    "FAISS",
-    "LLM",
-    "LLMs",
-    "API",
-    "APIs",
-    "Jupyter Notebook",
-    "Jupyter",
-    "Agile",
-    "CI/CD",
-    "ETL",
-    "ELT",
-)
-
-TECHNOLOGY_PATTERN = re.compile(
-    r"(?<![\w])(?:"
-    + "|".join(
-        re.escape(term)
-        for term in sorted(
-            set(TECHNOLOGY_TERMS),
-            key=len,
-            reverse=True,
-        )
-    )
-    + r")(?![\w])",
-    re.IGNORECASE,
-)
-
 
 def load_json(data):
     if isinstance(data, str):
         try:
             return json.loads(data)
         except json.JSONDecodeError as error:
-            raise ValueError(
-                "Stored resume JSON is invalid."
-            ) from error
-
+            raise ValueError("Stored resume JSON is invalid.") from error
     return data
 
 
 def load_resume_data(db, resume_id):
-
     extracted = (
         db.query(ExtractedResume)
-        .filter(
-            ExtractedResume.resume_id == resume_id
-        )
-        .order_by(
-            ExtractedResume.id.desc()
-        )
+        .filter(ExtractedResume.resume_id == resume_id)
+        .order_by(ExtractedResume.id.desc())
         .first()
     )
 
     formatting = (
         db.query(ResumeFormatting)
-        .filter(
-            ResumeFormatting.resume_id == resume_id
-        )
+        .filter(ResumeFormatting.resume_id == resume_id)
         .first()
     )
 
-    master_resume = (
+    master = (
         db.query(MasterResume)
-        .filter(
-            MasterResume.id == resume_id
-        )
+        .filter(MasterResume.id == resume_id)
         .first()
     )
 
-    if not master_resume:
-        raise ValueError(
-            "Original resume record not found."
-        )
+    if not master:
+        raise ValueError("Original resume record not found.")
 
     if not extracted or not extracted.extracted_data:
-        raise ValueError(
-            "Extracted resume data not found."
-        )
+        raise ValueError("Extracted resume data not found.")
 
     if not formatting or not formatting.formatting_data:
-        raise ValueError(
-            "Resume formatting data not found."
-        )
+        raise ValueError("Resume formatting data not found.")
 
-    original_path = Path(
-        master_resume.file_path
-    ).expanduser()
+    original_path = Path(master.file_path).expanduser().resolve()
 
-    if not original_path.is_absolute():
-        original_path = original_path.resolve()
+    if not original_path.is_file():
+        raise ValueError("Original uploaded DOCX file was not found.")
 
-    if not original_path.exists():
-        raise ValueError(
-            "Original uploaded DOCX file not found: "
-            f"{original_path}"
-        )
-
-    paragraphs = load_json(
-        extracted.extracted_data
-    )
+    paragraphs = load_json(extracted.extracted_data)
 
     if not isinstance(paragraphs, list):
-        raise ValueError(
-            "Extracted resume paragraphs are invalid."
-        )
+        raise ValueError("Extracted resume paragraphs are invalid.")
 
-    cleaned_paragraphs = []
+    cleaned = []
 
-    for index, item in enumerate(paragraphs):
-
+    for item in paragraphs:
         if not isinstance(item, dict):
-            raise ValueError(
-                f"Invalid paragraph at position {index}."
-            )
-
-        paragraph_id = (
-            item.get("id")
-            or item.get("paragraph_id")
-        )
-
-        text = clean_resume_text(
-            item.get("text", "")
-        )
-
-        if not paragraph_id:
-            raise ValueError(
-                f"Paragraph at position {index} has no ID."
-            )
-
-        if not text:
             continue
 
-        cleaned_paragraphs.append({
-            **item,
-            "id": paragraph_id,
-            "text": text,
-        })
+        paragraph_id = item.get("id") or item.get("paragraph_id")
+        text = clean_resume_text(item.get("text", ""))
+
+        if paragraph_id and text:
+            cleaned.append({
+                **item,
+                "id": paragraph_id,
+                "text": text,
+            })
 
     return {
-        "paragraphs": cleaned_paragraphs,
+        "paragraphs": cleaned,
         "formatting": formatting.formatting_data,
         "original_path": original_path,
     }
 
 
-def _format_lookup(formatting_data):
-
-    paragraph_lookup = {
+def _format_lookup(formatting):
+    return {
         item["id"]: item
-        for item in formatting_data.get(
-            "paragraphs", []
-        )
-        if isinstance(item, dict)
-        and item.get("id")
+        for item in formatting.get("paragraphs", [])
+        if isinstance(item, dict) and item.get("id")
     }
-
-    definitions = formatting_data.get(
-        "formats", {}
-    )
-
-    return paragraph_lookup, definitions
 
 
 def _decision_lookup(processed_data):
+    result = {}
 
-    lookup = {}
-
-    for decision in processed_data.get(
-        "paragraph_decisions",
-        [],
-    ):
-
+    for decision in processed_data.get("paragraph_decisions", []):
         if not isinstance(decision, dict):
             continue
 
-        ids = decision.get(
-            "source_paragraph_ids",
-            [],
-        )
+        ids = decision.get("source_paragraph_ids", [])
 
         if isinstance(ids, list) and len(ids) == 1:
-            lookup[ids[0]] = decision
+            result[ids[0]] = decision
 
-    return lookup
-
-
-def _selected_project_ids(
-    processed_data,
-    structure,
-):
-
-    valid_ids = {
-        project["title_id"]
-        for project in structure["projects"]
-    }
-
-    selected = processed_data.get(
-        "selected_project_ids"
-    )
-
-    if (
-        isinstance(selected, list)
-        and len(selected) == 3
-        and len(set(selected)) == 3
-        and set(selected).issubset(valid_ids)
-    ):
-        return set(selected)
-
-    return {
-        project["title_id"]
-        for project in structure["projects"][:3]
-    }
-
-
-def _renumber_project_title(text, number):
-
-    text = clean_resume_text(text)
-
-    text = re.sub(
-        r"^\s*\d+[\.\)]\s*",
-        "",
-        text,
-    )
-
-    return f"{number}. {text}"
+    return result
 
 
 def _base_run_properties(paragraph):
-
     for run in paragraph.runs:
         if run.text.strip() and run._r.rPr is not None:
             return deepcopy(run._r.rPr)
@@ -326,232 +137,73 @@ def _base_run_properties(paragraph):
     return None
 
 
-def _clear_paragraph_runs(paragraph):
-
+def _clear_runs(paragraph):
     for child in list(paragraph._p):
         if child.tag != qn("w:pPr"):
             paragraph._p.remove(child)
 
 
-def _append_styled_run(
-    paragraph,
-    text,
-    base_properties,
-    bold=False,
-):
-
+def _append_run(paragraph, text, properties=None, bold=None):
     if not text:
         return None
 
     run = paragraph.add_run(text)
 
-    if base_properties is not None:
-        run._r.insert(
-            0,
-            deepcopy(base_properties),
-        )
+    if properties is not None:
+        run._r.insert(0, deepcopy(properties))
 
-    run.bold = bold
+    if bold is not None:
+        run.bold = bold
 
     return run
 
 
-def _replace_paragraph_text(
-    paragraph,
-    text,
-    highlight_technologies=False,
-):
-
+def _replace_text(paragraph, text):
     text = clean_resume_text(text)
+    properties = _base_run_properties(paragraph)
 
-    base_properties = _base_run_properties(
-        paragraph
-    )
-
-    # Preserve paragraph properties, including style,
-    # alignment, indentation, spacing and numbering.
-    _clear_paragraph_runs(paragraph)
-
-    if not text:
-        return
-
-    if not highlight_technologies:
-        _append_styled_run(
-            paragraph,
-            text,
-            base_properties,
-        )
-        return
-
-    matches = list(
-        TECHNOLOGY_PATTERN.finditer(text)
-    )
-
-    if not matches:
-        _append_styled_run(
-            paragraph,
-            text,
-            base_properties,
-        )
-        return
-
-    cursor = 0
-
-    for match in matches:
-
-        if match.start() > cursor:
-            _append_styled_run(
-                paragraph,
-                text[cursor:match.start()],
-                base_properties,
-            )
-
-        _append_styled_run(
-            paragraph,
-            match.group(0),
-            base_properties,
-            bold=True,
-        )
-
-        cursor = match.end()
-
-    if cursor < len(text):
-        _append_styled_run(
-            paragraph,
-            text[cursor:],
-            base_properties,
-        )
+    _clear_runs(paragraph)
+    _append_run(paragraph, text, properties)
 
 
-def _achievement_parts(
-    original_text,
-    rewritten_text,
-):
-    """
-    Use the employer prefix from the original achievement.
+def _replace_achievement(paragraph, text):
+    text = clean_resume_text(text)
+    properties = _base_run_properties(paragraph)
 
-    This prevents an AI-generated employer name containing
-    a location from appearing in the final resume.
-    """
+    match = re.match(r"^([^:]{1,90})\s*:\s*(.*)$", text)
 
-    original_match = re.match(
-        r"^\s*([^:]{1,80}?)\s*:\s*(.*)$",
-        clean_resume_text(original_text),
-    )
+    _clear_runs(paragraph)
 
-    rewritten_match = re.match(
-        r"^\s*([^:]{1,100}?)\s*:\s*(.*)$",
-        clean_resume_text(rewritten_text),
-    )
+    if match:
+        company, body = match.groups()
 
-    if original_match:
-        company = clean_resume_text(
-            original_match.group(1)
-        )
-
-        if rewritten_match:
-            body = clean_resume_text(
-                rewritten_match.group(2)
-            )
-        else:
-            body = clean_resume_text(
-                rewritten_text
-            )
-
-        return company, body
-
-    if rewritten_match:
-        return (
-            clean_resume_text(rewritten_match.group(1)),
-            clean_resume_text(rewritten_match.group(2)),
-        )
-
-    return "", clean_resume_text(rewritten_text)
-
-
-def _replace_achievement_text(
-    paragraph,
-    original_text,
-    rewritten_text,
-):
-    """
-    Render an achievement using two separate runs:
-
-    - Employer name: bold.
-    - Achievement statement: regular weight.
-
-    Technology highlighting is deliberately disabled here.
-    """
-
-    company, body = _achievement_parts(
-        original_text,
-        rewritten_text,
-    )
-
-    base_properties = _base_run_properties(
-        paragraph
-    )
-
-    _clear_paragraph_runs(paragraph)
-
-    if company:
-        company_run = _append_styled_run(
+        company_run = _append_run(
             paragraph,
             f"{company}: ",
-            base_properties,
+            properties,
             bold=True,
         )
 
-        company_run.font.size = Pt(
-            ACHIEVEMENT_FONT_SIZE
-        )
+        if company_run:
+            company_run.font.size = Pt(10)
 
-    if body:
-        body_run = _append_styled_run(
+        body_run = _append_run(
             paragraph,
             body,
-            base_properties,
+            properties,
             bold=False,
         )
 
-        body_run.font.size = Pt(
-            ACHIEVEMENT_FONT_SIZE
-        )
+        if body_run:
+            body_run.font.size = Pt(10)
 
-
-def _format_key_achievements_heading(paragraph):
-
-    base_properties = _base_run_properties(
-        paragraph
-    )
-
-    _clear_paragraph_runs(paragraph)
-
-    heading_run = _append_styled_run(
-        paragraph,
-        "Key Achievements",
-        base_properties,
-        bold=True,
-    )
-
-    heading_run.font.size = Pt(
-        ACHIEVEMENT_HEADING_FONT_SIZE
-    )
-
-    paragraph.paragraph_format.space_before = Pt(5)
-    paragraph.paragraph_format.space_after = Pt(2)
-    paragraph.paragraph_format.keep_with_next = True
-    paragraph.paragraph_format.line_spacing = 1.0
+    else:
+        _append_run(paragraph, text, properties)
 
 
 def _remove_paragraph(paragraph):
-
-    # Word table cells must retain at least one paragraph.
     if isinstance(paragraph._parent, _Cell):
-        _replace_paragraph_text(
-            paragraph,
-            "",
-        )
+        _replace_text(paragraph, "")
         return
 
     element = paragraph._element
@@ -561,112 +213,59 @@ def _remove_paragraph(paragraph):
         parent.remove(element)
 
 
-def _validate_source_mapping(
-    document,
-    source_paragraphs,
-):
-
-    original_paragraphs = [
+def _validate_source_mapping(document, source_paragraphs):
+    original = [
         paragraph
         for paragraph in iter_paragraphs(document)
-        if paragraph.text.strip()
+        if clean_resume_text(paragraph.text)
     ]
 
-    if len(original_paragraphs) != len(source_paragraphs):
+    if len(original) != len(source_paragraphs):
         raise ValueError(
-            "Original DOCX paragraph count does not match "
-            "the SQL extraction. Refusing to apply formatting "
-            "to potentially incorrect paragraphs. "
-            f"SQL: {len(source_paragraphs)}, "
-            f"DOCX: {len(original_paragraphs)}."
+            "Original DOCX paragraph count differs from extracted data. "
+            "Refusing to apply decisions to incorrect paragraphs."
         )
 
-    for index, (source, original) in enumerate(
-        zip(
-            source_paragraphs,
-            original_paragraphs,
-        )
-    ):
-
-        if comparison_text(source["text"]) != comparison_text(
-            original.text
-        ):
+    for index, (source, paragraph) in enumerate(zip(source_paragraphs, original)):
+        if comparison_text(source["text"]) != comparison_text(paragraph.text):
             raise ValueError(
-                "Original DOCX content does not match SQL "
-                "paragraph mapping at position "
-                f"{index + 1} ({source['id']})."
+                "Original DOCX paragraph mapping mismatch at "
+                f"position {index + 1}, ID {source['id']}."
             )
 
-    return original_paragraphs
+    return original
 
 
-def _is_bullet(text, role, format_info):
-
-    has_literal_bullet = bool(
-        re.match(
-            r"^\s*[•●▪◦‣∙·\uf0b7]\s*",
-            text,
-        )
-    )
-
-    return (
-        role == "bullet"
-        or format_info.get("t") == "bullet"
-        or has_literal_bullet
-    )
-
-
-def create_resume_docx(
-    db,
-    processed_resume_id,
-):
-
+def create_resume_docx(db, processed_resume_id):
     processed = (
         db.query(ProcessedResume)
-        .filter(
-            ProcessedResume.id == processed_resume_id
-        )
+        .filter(ProcessedResume.id == processed_resume_id)
         .first()
     )
 
     if not processed:
-        raise ValueError(
-            "Processed resume not found."
-        )
+        raise ValueError("Processed resume not found.")
 
-    resume_data = load_resume_data(
-        db,
-        processed.resume_id,
-    )
-
-    processed_data = load_json(
-        processed.processed_data
-    )
+    processed_data = load_json(processed.processed_data)
 
     if not isinstance(processed_data, dict):
+        raise ValueError("Processed resume data is invalid.")
+
+    if processed_data.get("generation_version") != "2.0":
         raise ValueError(
-            "Processed resume data is invalid."
+            "This processed resume uses an older generation format. "
+            "Analyse the job description again before generating."
         )
 
+    resume_data = load_resume_data(db, processed.resume_id)
     source_paragraphs = resume_data["paragraphs"]
-    formatting = resume_data["formatting"]
-
-    if len(source_paragraphs) < 3:
-        raise ValueError(
-            "Original resume does not contain the "
-            "expected three-paragraph header."
-        )
 
     structure = build_resume_structure(
         source_paragraphs,
-        formatting,
+        resume_data["formatting"],
     )
 
-    # Open the original uploaded document instead of
-    # creating a new blank document.
-    document = Document(
-        str(resume_data["original_path"])
-    )
+    document = Document(str(resume_data["original_path"]))
 
     original_paragraphs = _validate_source_mapping(
         document,
@@ -678,272 +277,158 @@ def create_resume_docx(
         for item in structure["records"]
     }
 
-    format_lookup, _ = _format_lookup(
-        formatting
+    format_lookup = _format_lookup(resume_data["formatting"])
+    decisions = _decision_lookup(processed_data)
+
+    selected_projects = set(
+        processed_data.get("selected_project_ids", [])
     )
 
-    decisions = _decision_lookup(
-        processed_data
+    valid_project_ids = {
+        project["title_id"]
+        for project in structure["projects"]
+    }
+
+    if not selected_projects.issubset(valid_project_ids):
+        raise ValueError("Generated resume contains invalid project IDs.")
+
+    selected_achievements = set(
+        processed_data.get("selected_achievement_ids", [])
     )
 
-    selected_projects = _selected_project_ids(
-        processed_data,
-        structure
-    )
-
-    selected_achievement_ids = set(
-        processed_data.get(
-            "selected_achievement_ids",
-            [],
+    valid_achievement_ids = {
+        item["id"]
+        for item in structure["records"]
+        if (
+            item.get("section") == "HIGHLIGHTS"
+            and item.get("role") in {"bullet", "content"}
         )
-    )
+    }
+
+    if not selected_achievements.issubset(valid_achievement_ids):
+        raise ValueError("Generated resume contains invalid achievement IDs.")
 
     project_membership = {}
 
     for project in structure["projects"]:
         for paragraph_id in project["paragraph_ids"]:
-            project_membership[paragraph_id] = (
-                project["title_id"]
-            )
+            project_membership[paragraph_id] = project["title_id"]
 
-    paragraph_text_lookup = {
+    paragraph_text = {
         item["id"]: item["text"]
         for item in source_paragraphs
     }
 
     profile_id = structure["profile_id"]
-
-    original_profile = paragraph_text_lookup.get(
-        profile_id,
-        "",
-    )
-
     summary = clean_resume_text(
-        processed_data.get("professional_summary")
-        or original_profile
+        processed_data.get("professional_summary", "")
     )
-
-    summary_key = comparison_text(summary)
-    profile_key = comparison_text(original_profile)
 
     summary_inserted = False
     current_section = None
-    seen_highlights_text = set()
     project_number = 0
 
-    for index in range(
-        3,
-        len(source_paragraphs),
-    ):
-
-        source = source_paragraphs[index]
+    for index, source in enumerate(source_paragraphs):
+        paragraph_id = source["id"]
+        original_text = clean_resume_text(source["text"])
         paragraph = original_paragraphs[index]
 
-        paragraph_id = source["id"]
-        original_text = clean_resume_text(
-            source["text"]
-        )
-
-        record = records.get(
-            paragraph_id,
-            {},
-        )
-
-        role = record.get(
-            "role",
-            "content",
-        )
-
-        format_info = format_lookup.get(
-            paragraph_id,
-            {},
-        )
+        record = records.get(paragraph_id, {})
+        role = record.get("role", "content")
+        format_info = format_lookup.get(paragraph_id, {})
 
         if role == "section_heading":
-            current_section = clean_heading(
-                original_text
-            )
+            current_section = record.get("section")
 
-        # Replace the original profile paragraph.
         if paragraph_id == profile_id:
-
             if summary and not summary_inserted:
-                _replace_paragraph_text(
-                    paragraph,
-                    summary,
-                )
-
+                _replace_text(paragraph, summary)
                 summary_inserted = True
-
-                if current_section == "HIGHLIGHTS":
-                    seen_highlights_text.add(
-                        summary_key
-                    )
-
-                    seen_highlights_text.add(
-                        profile_key
-                    )
             else:
                 _remove_paragraph(paragraph)
-
             continue
 
-        # Remove duplicate profile paragraphs.
-        if role == "duplicate_profile":
+        if role == "profile":
             _remove_paragraph(paragraph)
             continue
 
-        # Format the Key Achievements subsection heading.
-        if (
-            current_section == "HIGHLIGHTS"
-            and role == "subheading"
-            and clean_heading(original_text) == "KEY ACHIEVEMENTS"
-        ):
-            _format_key_achievements_heading(
-                paragraph
-            )
-            continue
+        project_id = project_membership.get(paragraph_id)
 
-        # Prevent duplicate summaries in HIGHLIGHTS.
-        if (
-            current_section == "HIGHLIGHTS"
-            and role not in {
-                "section_heading",
-                "subheading",
-            }
-        ):
-
-            normalized = comparison_text(
-                original_text
-            )
-
-            if normalized and normalized in {
-                summary_key,
-                profile_key,
-            } | seen_highlights_text:
-
-                _remove_paragraph(paragraph)
-                continue
-
-            if normalized:
-                seen_highlights_text.add(
-                    normalized
-                )
-
-        # Remove paragraphs from unselected projects.
-        project_id = project_membership.get(
-            paragraph_id
-        )
-
-        if (
-            project_id
-            and project_id not in selected_projects
-        ):
+        if project_id and project_id not in selected_projects:
             _remove_paragraph(paragraph)
             continue
 
-        decision = decisions.get(
-            paragraph_id,
-            {},
-        )
+        if (
+            role == "project_title"
+            and project_id in selected_projects
+        ):
+            project_number += 1
 
-        action = decision.get(
-            "action",
-            "keep",
-        )
+        decision = decisions.get(paragraph_id, {})
+        action = decision.get("action", "keep")
 
         if action == "remove":
             _remove_paragraph(paragraph)
             continue
 
-        if (
-            action == "rewrite"
-            and decision.get("rewritten_text")
-        ):
-            text = clean_resume_text(
-                decision["rewritten_text"]
+        if action == "rewrite":
+            rewritten = clean_resume_text(
+                decision.get("rewritten_text", "")
             )
+
+            if not rewritten:
+                raise ValueError(
+                    f"Missing rewritten text for paragraph {paragraph_id}."
+                )
+
+            text = rewritten
         else:
             text = original_text
 
-        # Render selected Key Achievements separately.
         if (
             current_section == "HIGHLIGHTS"
-            and paragraph_id in selected_achievement_ids
+            and paragraph_id in selected_achievements
         ):
-            _replace_achievement_text(
-                paragraph,
-                original_text,
-                text,
-            )
+            _replace_achievement(paragraph, text)
             continue
 
-        # Renumber selected projects sequentially.
-        if role == "project_title":
-            project_number += 1
+        if (
+            current_section == "HIGHLIGHTS"
+            and role in {"bullet", "content"}
+            and paragraph_id not in selected_achievements
+            and paragraph_id in valid_achievement_ids
+        ):
+            _remove_paragraph(paragraph)
+            continue
 
-            text = _renumber_project_title(
-                text,
-                project_number,
-            )
-
-        is_bullet = _is_bullet(
-            text,
-            role,
-            format_info,
-        )
-
-        # Preserve original run formatting while highlighting
-        # technology terms in other bullet points.
-        should_highlight = is_bullet
+        # Keep the original Word list formatting. Remove only literal
+        # bullet glyphs if the source text itself contains one.
+        if format_info.get("t") == "bullet":
+            text = re.sub(r"^\s*[•●▪◦‣∙·]\s*", "", text)
 
         if text != clean_resume_text(paragraph.text):
-
-            _replace_paragraph_text(
-                paragraph,
-                text,
-                highlight_technologies=should_highlight,
-            )
-
-        elif should_highlight and TECHNOLOGY_PATTERN.search(text):
-
-            _replace_paragraph_text(
-                paragraph,
-                text,
-                highlight_technologies=True,
-            )
+            _replace_text(paragraph, text)
 
     if summary and not summary_inserted:
         raise ValueError(
-            "Could not identify the original profile paragraph. "
-            "Refusing to insert a newly styled paragraph."
+            "A professional summary was generated, but no summary "
+            "paragraph was identified in the original DOCX. "
+            "Add a Summary/Profile section to the source resume."
         )
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    output_path = (
-        OUTPUT_DIR
-        / f"resume_{processed_resume_id}.docx"
-    )
-
+    output_path = OUTPUT_DIR / f"resume_{processed_resume_id}.docx"
     document.save(output_path)
 
     return str(output_path)
 
 
-def convert_to_pdf(docx_path: str) -> str:
+def convert_to_pdf(docx_path):
+    docx_path = Path(docx_path).resolve()
 
-    docx_path = Path(
-        docx_path
-    ).resolve()
-
-    if not docx_path.exists():
-        raise FileNotFoundError(
-            f"DOCX file not found: {docx_path}"
-        )
+    if not docx_path.is_file():
+        raise FileNotFoundError(f"DOCX file not found: {docx_path}")
 
     try:
         subprocess.run(
@@ -968,15 +453,11 @@ def convert_to_pdf(docx_path: str) -> str:
         ) from error
 
     except subprocess.TimeoutExpired as error:
-        raise RuntimeError(
-            "PDF conversion timed out."
-        ) from error
+        raise RuntimeError("PDF conversion timed out.") from error
 
     pdf_path = docx_path.with_suffix(".pdf")
 
     if not pdf_path.exists():
-        raise RuntimeError(
-            "LibreOffice completed but the PDF was not created."
-        )
+        raise RuntimeError("PDF conversion completed but no PDF was created.")
 
     return str(pdf_path)

@@ -1,96 +1,116 @@
 import re
 
-from backend.services.resume_text import (
-    clean_resume_text,
-    comparison_text,
-)
+from backend.services.resume_text import clean_resume_text
 
 
-MAJOR_SECTIONS = {
-    "HIGHLIGHTS",
-    "EXPERIENCE",
-    "KEY PROJECTS",
-    "PROJECTS",
-    "CERTIFICATIONS",
-    "KEY SKILLS",
-    "SKILLS",
-    "EDUCATION",
+SECTION_ALIASES = {
+    "SUMMARY": "SUMMARY",
+    "PROFILE": "SUMMARY",
+    "PROFESSIONAL SUMMARY": "SUMMARY",
+    "CAREER SUMMARY": "SUMMARY",
+    "HIGHLIGHTS": "HIGHLIGHTS",
+    "KEY HIGHLIGHTS": "HIGHLIGHTS",
+    "EXPERIENCE": "EXPERIENCE",
+    "WORK EXPERIENCE": "EXPERIENCE",
+    "PROFESSIONAL EXPERIENCE": "EXPERIENCE",
+    "EMPLOYMENT HISTORY": "EXPERIENCE",
+    "CAREER HISTORY": "EXPERIENCE",
+    "PROJECTS": "PROJECTS",
+    "KEY PROJECTS": "PROJECTS",
+    "PERSONAL PROJECTS": "PROJECTS",
+    "ACADEMIC PROJECTS": "PROJECTS",
+    "SELECTED PROJECTS": "PROJECTS",
+    "TECHNICAL PROJECTS": "PROJECTS",
+    "SKILLS": "SKILLS",
+    "KEY SKILLS": "SKILLS",
+    "TECHNICAL SKILLS": "SKILLS",
+    "CORE SKILLS": "SKILLS",
+    "TECHNOLOGIES": "SKILLS",
+    "CERTIFICATIONS": "CERTIFICATIONS",
+    "CERTIFICATES": "CERTIFICATIONS",
+    "EDUCATION": "EDUCATION",
+    "ACADEMIC BACKGROUND": "EDUCATION",
+    "QUALIFICATIONS": "EDUCATION",
+    "AWARDS": "AWARDS",
+    "ACHIEVEMENTS": "AWARDS",
+    "PUBLICATIONS": "PUBLICATIONS",
+    "VOLUNTEERING": "VOLUNTEERING",
+    "VOLUNTEER EXPERIENCE": "VOLUNTEERING",
 }
 
 
-KNOWN_PROJECT_TITLES = {
-    "FOOTBALL MATCH PREDICTION ANALYSIS",
-    "CYCLISTIC BIKE SHARE ANALYSIS",
-    "BELLABEAT FITNESS ANALYSIS",
-    "MELBOURNE HOUSING MARKET ANALYSIS",
-    "CONTOSO DATABASE ANALYSIS",
-    "VICTORIA STATE BUDGET 2025–2026 ANALYSIS",
-    "VICTORIA STATE BUDGET 2025-2026 ANALYSIS",
-    "BLACKMORES HR DASHBOARD",
-    "WOOLWORTHS REWARDS DASHBOARD",
-    "NETFLIX VIEWING & RECOMMENDATIONS ANALYSIS",
-    "YOUTUBE CLONE – FRONTEND DEVELOPMENT",
-    "YOUTUBE CLONE - FRONTEND DEVELOPMENT",
-}
+def clean_heading(text):
+    text = clean_resume_text(text).upper()
+    text = re.sub(r"^[\s:|]+|[\s:|]+$", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.rstrip(".:")
 
 
-def clean_heading(text: str) -> str:
-    return re.sub(
-        r"[\s:]+$",
-        "",
-        clean_resume_text(text),
-    ).upper()
+def canonical_section(text):
+    return SECTION_ALIASES.get(clean_heading(text))
 
 
-def is_major_heading(text: str) -> bool:
-    return clean_heading(text) in MAJOR_SECTIONS
+def is_major_heading(text):
+    return canonical_section(text) is not None
 
 
-def _format_type(format_lookup: dict, paragraph_id: str) -> str:
-    return format_lookup.get(paragraph_id, {}).get("t", "")
-
-
-def _is_bullet(text: str, element_type: str) -> bool:
-    return element_type == "bullet" or bool(
-        re.match(
-            r"^\s*[•●▪◦‣∙·\uf0b7\-]\s+",
-            text,
-        )
+def _is_bullet(text, element_type):
+    return (
+        element_type == "bullet"
+        or bool(re.match(r"^\s*[•●▪◦‣∙·\-]\s+", text))
     )
 
 
-def _is_technology_line(text: str) -> bool:
-    return bool(
-        re.match(
-            r"^\s*(technologies|technology|tools|tech stack|technology stack)\s*:",
-            text,
-            re.I,
-        )
-    )
+def _is_metadata(text):
+    return bool(re.match(
+        r"^\s*(technologies|technology|tools|tech stack|"
+        r"technology stack|tools used|stack)\s*:",
+        text,
+        re.IGNORECASE,
+    ))
 
 
-def _is_project_title(text: str, element_type: str) -> bool:
-    normalized = clean_heading(text)
-
-    normalized = re.sub(
-        r"^\s*\d+[\.\)]\s*",
-        "",
-        normalized,
-    )
-
-    if normalized in KNOWN_PROJECT_TITLES:
-        return True
-
-    if _is_technology_line(text):
+def _looks_like_project_title(text, element_type, is_bullet):
+    if not text or is_bullet or _is_metadata(text):
         return False
 
-    return element_type == "subheader"
+    if element_type in {"subheader", "heading", "title"}:
+        return True
+
+    words = text.split()
+
+    if len(words) > 10 or re.search(r"[.!?]$", text):
+        return False
+
+    action_words = (
+        "developed", "built", "created", "analysed", "analyzed",
+        "implemented", "designed", "utilised", "utilized",
+        "managed", "improved", "responsible",
+    )
+
+    return (
+        len(words) <= 8
+        and not any(word in text.lower() for word in action_words)
+    )
 
 
-def build_resume_structure(
-    paragraphs: list,
-    formatting: dict,
-) -> dict:
+def _looks_like_role_heading(text, element_type):
+    if element_type in {"subheader", "heading", "title"}:
+        return True
+
+    return (
+        len(text.split()) <= 12
+        and bool(re.search(
+            r"\b(19|20)\d{2}\b|\b(present|current)\b",
+            text,
+            re.IGNORECASE,
+        ))
+    )
+
+
+def build_resume_structure(paragraphs, formatting):
+    if not isinstance(paragraphs, list) or not paragraphs:
+        raise ValueError("Resume paragraphs are missing or invalid.")
 
     format_lookup = {
         item["id"]: item
@@ -98,201 +118,164 @@ def build_resume_structure(
         if isinstance(item, dict) and item.get("id")
     }
 
-    sections = []
-    current_section = None
-
-    project_groups = []
-    current_project = None
-
-    profile_id = None
-    profile_comparison = None
-
-    seen_highlights_text = set()
-
     records = []
+    sections = []
+    projects = []
+
+    current_section = None
+    current_project = None
+    profile_id = None
+    seen_ids = set()
 
     for index, paragraph in enumerate(paragraphs):
-
         if not isinstance(paragraph, dict):
-            raise ValueError(
-                f"Invalid paragraph at position {index}."
-            )
+            raise ValueError(f"Invalid paragraph at position {index}.")
 
-        paragraph_id = (
-            paragraph.get("id")
-            or paragraph.get("paragraph_id")
-        )
-
-        text = clean_resume_text(
-            paragraph.get("text", "")
-        )
+        paragraph_id = paragraph.get("id") or paragraph.get("paragraph_id")
+        text = clean_resume_text(paragraph.get("text", ""))
 
         if not paragraph_id:
-            raise ValueError(
-                f"Paragraph at position {index} has no ID."
-            )
+            raise ValueError(f"Paragraph {index} has no ID.")
 
-        element_type = _format_type(
-            format_lookup,
-            paragraph_id,
-        )
+        if paragraph_id in seen_ids:
+            raise ValueError(f"Duplicate paragraph ID: {paragraph_id}")
 
-        normalized = comparison_text(text)
+        seen_ids.add(paragraph_id)
 
-        is_bullet = _is_bullet(
-            text,
-            element_type,
-        )
+        if not text:
+            continue
 
-        # The first three paragraphs are the fixed header.
-        if index < 3:
-            role = "header"
+        element_type = format_lookup.get(
+            paragraph_id, {}
+        ).get("t", "")
 
-        # Major resume sections.
-        elif is_major_heading(text):
+        bullet = _is_bullet(text, element_type)
+        section_heading = canonical_section(text)
 
+        if section_heading:
             role = "section_heading"
-
-            current_section = clean_heading(text)
+            current_section = section_heading
+            current_project = None
 
             sections.append({
                 "name": current_section,
                 "paragraph_id": paragraph_id,
             })
 
-            current_project = None
-
-        # Project titles.
         elif (
-            current_section == "KEY PROJECTS"
-            and _is_project_title(text, element_type)
+            current_section == "PROJECTS"
+            and _looks_like_project_title(text, element_type, bullet)
         ):
-
             role = "project_title"
 
             current_project = {
                 "title": text,
                 "title_id": paragraph_id,
                 "paragraph_ids": [paragraph_id],
+                "content_ids": [],
             }
 
-            project_groups.append(current_project)
+            projects.append(current_project)
 
-        # Key Achievements heading.
+        elif current_section == "PROJECTS" and current_project:
+            role = (
+                "project_metadata"
+                if _is_metadata(text)
+                else "project_content"
+            )
+
+            current_project["paragraph_ids"].append(paragraph_id)
+
+            if role == "project_content":
+                current_project["content_ids"].append(paragraph_id)
+
         elif (
             current_section == "HIGHLIGHTS"
             and clean_heading(text) == "KEY ACHIEVEMENTS"
         ):
-
             role = "subheading"
 
-        # Profile and duplicate-profile detection.
-        elif (
-            current_section == "HIGHLIGHTS"
-            and not is_bullet
-        ):
-
-            if profile_id is None:
-
-                role = "profile"
-
-                profile_id = paragraph_id
-                profile_comparison = normalized
-
-                seen_highlights_text.add(normalized)
-
-            elif normalized and (
-                normalized == profile_comparison
-                or normalized in seen_highlights_text
-            ):
-
-                role = "duplicate_profile"
-
+        elif current_section == "EXPERIENCE":
+            if bullet:
+                role = "bullet"
+            elif _looks_like_role_heading(text, element_type):
+                role = "subheading"
             else:
-
                 role = "content"
 
-                if normalized:
-                    seen_highlights_text.add(normalized)
-
-        # Content belonging to the current project.
-        elif (
-            current_section == "KEY PROJECTS"
-            and current_project is not None
-        ):
-
-            if _is_technology_line(text):
-                role = "project_metadata"
-            else:
-                role = "project_content"
-
-            current_project["paragraph_ids"].append(
-                paragraph_id
-            )
-
-        elif element_type == "subheader":
-
-            role = "subheading"
-
-        elif is_bullet:
-
+        elif bullet:
             role = "bullet"
 
-        else:
+        elif element_type in {"subheader", "heading", "title"}:
+            role = "subheading"
 
+        else:
             role = "content"
 
-        # Ensure all project paragraphs belong to their project group.
         if (
-            current_section == "KEY PROJECTS"
-            and current_project is not None
-            and paragraph_id not in current_project["paragraph_ids"]
+            current_section == "SUMMARY"
+            and role == "content"
+            and profile_id is None
         ):
-
-            current_project["paragraph_ids"].append(
-                paragraph_id
-            )
+            profile_id = paragraph_id
+            role = "profile"
 
         records.append({
             "id": paragraph_id,
             "text": text,
             "section": current_section,
             "role": role,
-            "is_bullet": is_bullet,
+            "is_bullet": bullet,
             "format_type": element_type,
         })
 
+    # Some resumes place the profile directly below the contact header
+    # without a dedicated SUMMARY heading.
+    if profile_id is None:
+        for record in records:
+            if (
+                record["role"] == "content"
+                and record["section"] not in {
+                    "EXPERIENCE",
+                    "PROJECTS",
+                    "EDUCATION",
+                    "CERTIFICATIONS",
+                    "SKILLS",
+                    "AWARDS",
+                }
+                and len(record["text"].split()) >= 20
+            ):
+                profile_id = record["id"]
+                record["role"] = "profile"
+                break
+
     structural_roles = {
-        "header",
         "section_heading",
         "subheading",
         "project_title",
         "project_metadata",
         "profile",
-        "duplicate_profile",
     }
 
-    structural_ids = {
-        item["id"]
-        for item in records
-        if item["role"] in structural_roles
-    }
-
-    editable_ids = {
-        item["id"]
-        for item in records
-        if item["role"] in {
-            "bullet",
-            "project_content",
-            "content",
-        }
+    editable_roles = {
+        "bullet",
+        "content",
+        "project_content",
     }
 
     return {
         "records": records,
         "sections": sections,
-        "projects": project_groups,
+        "projects": projects,
         "profile_id": profile_id,
-        "structural_ids": structural_ids,
-        "editable_ids": editable_ids,
+        "structural_ids": {
+            item["id"]
+            for item in records
+            if item["role"] in structural_roles
+        },
+        "editable_ids": {
+            item["id"]
+            for item in records
+            if item["role"] in editable_roles
+        },
     }

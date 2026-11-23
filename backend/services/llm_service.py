@@ -50,7 +50,7 @@ def generate_response(system_prompt: str, user_prompt: str) -> dict:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.2,
+            temperature=0.5,
             max_completion_tokens=8192,
             response_format={"type": "json_object"},
         )

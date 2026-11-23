@@ -11,11 +11,14 @@ from sentence_transformers import SentenceTransformer
 CACHE_ROOT = Path(__file__).resolve().parents[1] / "rag_storage"
 
 MODEL_NAME = "BAAI/bge-base-en-v1.5"
-MODEL_VERSION = "1.0"
+MODEL_VERSION = "2.0"
+
+QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 DEVICE = "cpu"
 BATCH_SIZE = 16
 MAX_SEQUENCE_LENGTH = 512
+
 
 class EmbeddingEngine:
 
@@ -23,53 +26,46 @@ class EmbeddingEngine:
         torch.set_num_threads(4)
 
         self.model = SentenceTransformer(
-            MODEL_NAME, 
-            device=DEVICE
+            MODEL_NAME,
+            device=DEVICE,
         )
 
         self.model.max_seq_length = MAX_SEQUENCE_LENGTH
 
-    def encode_query(self, query: str) -> np.ndarray:
-
-        if not query or not query.strip():
+    def encode_query(self, query):
+        if not isinstance(query, str) or not query.strip():
             raise ValueError("Query cannot be empty.")
 
         embedding = self.model.encode(
-            query.strip(),
+            QUERY_PREFIX + query.strip(),
             convert_to_numpy=True,
-            normalize_embeddings=True
-        ).astype(np.float32)
+            normalize_embeddings=True,
+        )
 
-        return embedding
+        return np.asarray(embedding, dtype=np.float32)
 
     @staticmethod
-    def calculate_hash(chunks: list) -> str:
+    def calculate_hash(chunks):
         content = json.dumps(
             chunks,
             ensure_ascii=False,
             sort_keys=True,
-            separators=(",", ":")
+            separators=(",", ":"),
         )
 
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-    def generate_embeddings(
-            self,
-            resume_id: int,
-            chunks: list,
-            force: bool = False
-    ) -> np.ndarray:
+    def generate_embeddings(self, resume_id, chunks, force=False):
+        if not chunks:
+            raise ValueError("Cannot generate embeddings without chunks.")
 
-        cache_dir = CACHE_ROOT/ str(resume_id)
+        cache_dir = CACHE_ROOT / str(resume_id)
         cache_dir.mkdir(parents=True, exist_ok=True)
 
         embeddings_path = cache_dir / "embeddings.npy"
         metadata_path = cache_dir / "embeddings_metadata.json"
 
         chunks_hash = self.calculate_hash(chunks)
-
-        if not chunks:
-            raise ValueError("Cannot generate embeddings: no chunks available.")
 
         if (
             not force
@@ -83,36 +79,38 @@ class EmbeddingEngine:
                 if (
                     metadata.get("chunks_hash") == chunks_hash
                     and metadata.get("model_name") == MODEL_NAME
-                    and metadata.get("max_sequence_length") == MAX_SEQUENCE_LENGTH
+                    and metadata.get("model_version") == MODEL_VERSION
                 ):
                     embeddings = np.load(
                         embeddings_path,
-                        allow_pickle=False
+                        allow_pickle=False,
+                    )
+
+                    expected_shape = (
+                        len(chunks),
+                        self.model.get_embedding_dimension(),
                     )
 
                     if (
-                        embeddings.ndim == 2
-                        and embeddings.shape == (
-                            len(chunks),
-                            self.model.get_embedding_dimension()
-                        )
-                        and len(embeddings) > 0
+                        embeddings.shape == expected_shape
                         and np.isfinite(embeddings).all()
                     ):
-                        print("Using cached embeddings.")
-                        return embeddings
+                        return embeddings.astype(np.float32)
 
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
 
-        texts = [chunk["text"] for chunk in chunks]
-
+        texts = [
+            item.get("embedding_text") or item["text"]
+            for item in chunks
+        ]
+        
         embeddings = self.model.encode(
             texts,
             batch_size=BATCH_SIZE,
             show_progress_bar=True,
             convert_to_numpy=True,
-            normalize_embeddings=True
+            normalize_embeddings=True,
         ).astype(np.float32)
 
         temporary_path = embeddings_path.with_suffix(".tmp.npy")
@@ -123,11 +121,11 @@ class EmbeddingEngine:
             "resume_id": resume_id,
             "model_name": MODEL_NAME,
             "model_version": MODEL_VERSION,
-            "dimensions": embeddings.shape[1],
+            "dimensions": int(embeddings.shape[1]),
             "batch_size": BATCH_SIZE,
             "max_sequence_length": MAX_SEQUENCE_LENGTH,
             "chunks_hash": chunks_hash,
-            "embedding_count": len(embeddings)
+            "embedding_count": len(embeddings),
         }
 
         temporary_metadata = metadata_path.with_suffix(".tmp")
@@ -136,7 +134,5 @@ class EmbeddingEngine:
             json.dump(metadata, file, indent=2)
 
         temporary_metadata.replace(metadata_path)
-
-        print("Generated and saved embeddings.")
 
         return embeddings
