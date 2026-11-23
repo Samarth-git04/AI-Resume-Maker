@@ -48,8 +48,18 @@ def _is_bullet(text: str, element_type: str) -> bool:
 
 def _is_project_title(text: str, element_type: str) -> bool:
     normalized = clean_heading(text)
+    normalized = re.sub(r"^\s*\d+[\.\)]\s*", "", normalized)
+
     if normalized in KNOWN_PROJECT_TITLES:
         return True
+
+    if re.match(
+        r"^(technologies|technology|tools|tech stack|technology stack)\s*:",
+        text,
+        re.I,
+    ):
+        return False
+
     return element_type == "subheader"
 
 
@@ -87,9 +97,8 @@ def build_resume_structure(paragraphs: list, formatting: dict) -> dict:
             sections.append({"name": current_section, "paragraph_id": pid})
             current_project = None
             key_achievements_seen = False
-        elif current_section == "KEY PROJECTS" and (
-            clean_heading(text) in KNOWN_PROJECT_TITLES
-            or (current_project is None and element_type == "subheader")
+        elif current_section == "KEY PROJECTS" and _is_project_title(
+            text, element_type
         ):
             role = "project_title"
             current_project = {
