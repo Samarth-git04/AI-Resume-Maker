@@ -29,7 +29,10 @@ Never invent:
 Your task is to create a tailored resume plan.
 
 1. PROFESSIONAL SUMMARY
-Write a concise summary targeted to the job description.
+Write a concise, targeted professional summary of 45–55 words.
+The absolute maximum is 75 words. Never exceed this limit.
+Prioritise the candidate's most relevant experience, technical skills,
+and qualifications for the target role.
 Use only facts supported by source paragraph IDs.
 Do not infer experience duration or seniority.
 Return the source IDs used.
@@ -137,7 +140,7 @@ def _validate_summary(summary, source_map):
     if _numbers(text) - _numbers(source_text):
         raise ValueError("The summary contains unsupported numerical claims.")
 
-    if len(text.split()) > 65:
+    if len(text.split()) > 75:
         raise ValueError("The generated summary is too long.")
 
     return {

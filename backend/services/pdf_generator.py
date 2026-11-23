@@ -165,6 +165,13 @@ def _replace_text(paragraph, text):
     _clear_runs(paragraph)
     _append_run(paragraph, text, properties)
 
+def _renumber_project_title(paragraph, number):
+    text = clean_resume_text(paragraph.text)
+    text = re.sub(r"^\s*\d+[\.\)]\s*", "", text, count=1)
+
+    properties = _base_run_properties(paragraph)
+    _clear_runs(paragraph)
+    _append_run(paragraph, f"{number}. {text}", properties)
 
 def _replace_achievement(paragraph, text):
     text = clean_resume_text(text)
@@ -405,6 +412,10 @@ def create_resume_docx(db, processed_resume_id):
         # bullet glyphs if the source text itself contains one.
         if format_info.get("t") == "bullet":
             text = re.sub(r"^\s*[•●▪◦‣∙·]\s*", "", text)
+
+        if role == "project_title" and project_id in selected_projects:
+            text = re.sub(r"^\s*\d+[\.\)]\s*", "", text, count=1)
+            text = f"{project_number}. {text}"
 
         if text != clean_resume_text(paragraph.text):
             _replace_text(paragraph, text)
