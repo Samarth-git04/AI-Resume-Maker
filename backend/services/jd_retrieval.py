@@ -1,15 +1,29 @@
+from sqlalchemy.orm import Session
+
 from backend.services.jd_analyzer import extract_requirements, TOP_K
 from backend.services.embeddings import EmbeddingEngine
 from backend.services.vector_store import VectorStore
+from backend.services.retrieval import prepare_resume_cache
 
 
-def retrieve_for_job(resume_id: int, job_description: str) -> dict:
+def retrieve_for_job(
+    db: Session,
+    resume_id: int,
+    job_description: str
+) -> dict:
 
     requirements = extract_requirements(job_description)
 
-    embedding_engine = EmbeddingEngine()
-    vector_store = VectorStore(resume_id)
+    cache_result = prepare_resume_cache(db, resume_id)
 
+    embedding_engine = EmbeddingEngine()
+
+    embedding_engine.generate_embeddings(
+        resume_id,
+        cache_result["chunks"]
+    )
+
+    vector_store = VectorStore(resume_id)
     vector_store.prepare()
 
     requirement_results = []
@@ -37,7 +51,6 @@ def retrieve_for_job(resume_id: int, job_description: str) -> dict:
             for paragraph_id in paragraph["paragraph_ids"]:
 
                 if paragraph_id not in paragraph_map:
-
                     paragraph_map[paragraph_id] = {
                         "paragraph_id": paragraph_id,
                         "text": paragraph["text"],

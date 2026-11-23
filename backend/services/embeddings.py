@@ -10,8 +10,6 @@ from sentence_transformers import SentenceTransformer
 
 CACHE_ROOT = Path(__file__).resolve().parents[1] / "rag_storage"
 
-CACHE_ROOT = Path(__file__).resolve().parents[1] / "rag_storage"
-
 MODEL_NAME = "BAAI/bge-base-en-v1.5"
 MODEL_VERSION = "1.0"
 
@@ -30,6 +28,19 @@ class EmbeddingEngine:
         )
 
         self.model.max_seq_length = MAX_SEQUENCE_LENGTH
+
+    def encode_query(self, query: str) -> np.ndarray:
+
+        if not query or not query.strip():
+            raise ValueError("Query cannot be empty.")
+
+        embedding = self.model.encode(
+            query.strip(),
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        ).astype(np.float32)
+
+        return embedding
 
     @staticmethod
     def calculate_hash(chunks: list) -> str:
@@ -57,43 +68,52 @@ class EmbeddingEngine:
 
         chunks_hash = self.calculate_hash(chunks)
 
+        if not chunks:
+            raise ValueError("Cannot generate embeddings: no chunks available.")
+
         if (
             not force
             and embeddings_path.exists()
             and metadata_path.exists()
         ):
-            with metadata_path.open("r", encoding="utf-8") as file:
-                metadata = json.load(file)
-
-            if (
-                metadata.get("chunks_hash") == chunks_hash
-                and metadata.get("model_name") == MODEL_NAME
-                and metadata.get("max_sequence_length") == MAX_SEQUENCE_LENGTH
-            ):
-                embeddings = np.load(embeddings_path)
+            try:
+                with metadata_path.open("r", encoding="utf-8") as file:
+                    metadata = json.load(file)
 
                 if (
-                    embeddings.ndim == 2
-                    and embeddings.shape == (
-                        len(chunks),
-                        self.model.get_embedding_dimension()
-                    )
-                    and np.isfinite(embeddings).all()
+                    metadata.get("chunks_hash") == chunks_hash
+                    and metadata.get("model_name") == MODEL_NAME
+                    and metadata.get("max_sequence_length") == MAX_SEQUENCE_LENGTH
                 ):
-                    print("Using cached embeddings.")
-                    return embeddings
+                    embeddings = np.load(
+                        embeddings_path,
+                        allow_pickle=False
+                    )
+
+                    if (
+                        embeddings.ndim == 2
+                        and embeddings.shape == (
+                            len(chunks),
+                            self.model.get_embedding_dimension()
+                        )
+                        and len(embeddings) > 0
+                        and np.isfinite(embeddings).all()
+                    ):
+                        print("Using cached embeddings.")
+                        return embeddings
+
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
 
         texts = [chunk["text"] for chunk in chunks]
 
         embeddings = self.model.encode(
-            texts, 
+            texts,
             batch_size=BATCH_SIZE,
             show_progress_bar=True,
             convert_to_numpy=True,
             normalize_embeddings=True
-        )
-
-        embeddings = embeddings.astype(np.float32)
+        ).astype(np.float32)
 
         temporary_path = embeddings_path.with_suffix(".tmp.npy")
         np.save(temporary_path, embeddings)
@@ -120,22 +140,3 @@ class EmbeddingEngine:
         print("Generated and saved embeddings.")
 
         return embeddings
-
-    def encode_query(self, query: str) -> np.ndarray:
-
-        if not isinstance(query, str) or not query.strip():
-            raise ValueError("Query must be a non-empty string.")
-
-        formatted_query = (
-            "Represent this sentence for searching relevant passages: "
-            + query.strip()
-        )
-
-        embedding = self.model.encode(
-            [formatted_query],
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False
-        )
-
-        return embedding[0].astype(np.float32)

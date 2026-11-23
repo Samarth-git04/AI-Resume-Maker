@@ -120,7 +120,6 @@ def load_json(file_path: Path):
     with file_path.open("r", encoding="utf-8") as file:
         return json.load(file)
 
-
 def prepare_resume_cache(
     db: Session,
     resume_id: int,
@@ -128,29 +127,44 @@ def prepare_resume_cache(
 ) -> dict:
 
     paragraphs = get_source_paragraphs(db, resume_id)
+
+    if not paragraphs:
+        raise ValueError(f"No source paragraphs found for resume_id={resume_id}")
+
     source_hash = calculate_source_hash(paragraphs)
 
     cache_dir = CACHE_ROOT / str(resume_id)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
     chunks_path = cache_dir / "chunks.json"
     metadata_path = cache_dir / "chunk_metadata.json"
 
     if not force and chunks_path.exists() and metadata_path.exists():
+        try:
+            metadata = load_json(metadata_path)
+            chunks = load_json(chunks_path)
 
-        metadata = load_json(metadata_path)
+            if (
+                isinstance(chunks, list)
+                and chunks
+                and metadata.get("source_hash") == source_hash
+                and metadata.get("preprocessing_version") == PREPROCESSING_VERSION
+            ):
+                return {
+                    "cache_hit": True,
+                    "resume_id": resume_id,
+                    "chunks": chunks,
+                    "cache_dir": str(cache_dir)
+                }
 
-        if (
-            metadata.get("source_hash") == source_hash
-            and metadata.get("preprocessing_version") == PREPROCESSING_VERSION
-        ):
-            return {
-                "cache_hit": True,
-                "resume_id": resume_id,
-                "chunks": load_json(chunks_path),
-                "cache_dir": str(cache_dir)
-            }
+        except (ValueError, OSError, json.JSONDecodeError):
+            pass
 
     processed_paragraphs = preprocess_paragraphs(paragraphs)
     chunks = create_chunks(processed_paragraphs)
+
+    if not chunks:
+        raise ValueError(f"No chunks could be generated for resume_id={resume_id}")
 
     metadata = {
         "resume_id": resume_id,

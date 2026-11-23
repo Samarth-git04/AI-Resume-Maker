@@ -18,7 +18,6 @@ from backend.database.models import (
 
 
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "generated"
-HEADER_RESUME_ID = 1
 
 
 def load_json(data):
@@ -257,6 +256,63 @@ def add_fixed_header(document, header_data):
     links_paragraph.paragraph_format.space_before = Pt(0)
     links_paragraph.paragraph_format.space_after = Pt(0)
 
+def add_tailored_sections(document, decisions, resume_data):
+    source_paragraphs = resume_data["paragraphs"]
+
+    paragraph_order = {
+        item["id"]: index
+        for index, item in enumerate(source_paragraphs)
+    }
+
+    original_text = {
+        item["id"]: item["text"]
+        for item in source_paragraphs
+    }
+
+    decisions = sorted(
+        decisions,
+        key=lambda item: min(
+            paragraph_order[pid]
+            for pid in item["source_paragraph_ids"]
+        )
+    )
+
+    sections = {}
+
+    for decision in decisions:
+        if decision["action"] == "remove":
+            continue
+
+        section_name = decision["section_name"]
+
+        if section_name not in sections:
+            sections[section_name] = []
+
+        if decision["action"] == "keep":
+            text = original_text[decision["source_paragraph_ids"][0]]
+
+        else:
+            text = decision["rewritten_text"]
+
+        sections[section_name].append({
+            "text": text,
+            "paragraph_id": decision["source_paragraph_ids"][0]
+        })
+
+    for section_name, paragraphs in sections.items():
+        if not paragraphs:
+            continue
+
+        document.add_heading(section_name, level=1)
+
+        for item in paragraphs:
+            add_paragraph(
+                document,
+                item["text"],
+                item["paragraph_id"],
+                resume_data["formatting"]
+            )
+
 def create_resume_docx(db, processed_resume_id):
     processed = db.query(ProcessedResume).filter(
         ProcessedResume.id == processed_resume_id
@@ -265,30 +321,29 @@ def create_resume_docx(db, processed_resume_id):
     if not processed:
         raise ValueError("Processed resume not found.")
 
-    header_data = load_resume_data(db, HEADER_RESUME_ID)
     resume_data = load_resume_data(db, processed.resume_id)
     processed_data = load_json(processed.processed_data)
 
     document = Document()
 
-    add_fixed_header(document, header_data)
+    add_fixed_header(document, resume_data)
 
     summary = processed_data.get("professional_summary")
+
     if summary:
         document.add_heading("Professional Summary", level=1)
         document.add_paragraph(summary)
 
-    for item in processed_data.get("tailored_paragraphs", []):
-        add_paragraph(
-            document,
-            item["rewritten_text"],
-            item["paragraph_id"],
-            resume_data["formatting"]
-        )
+    add_tailored_sections(
+        document,
+        processed_data.get("paragraph_decisions", []),
+        resume_data
+    )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     output_path = OUTPUT_DIR / f"resume_{processed_resume_id}.docx"
+
     document.save(output_path)
 
     return str(output_path)

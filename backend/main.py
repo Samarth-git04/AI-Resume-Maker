@@ -19,6 +19,7 @@ from backend.database.models import (
     ResumeFormatting,
     ProcessedResume
 )
+from backend.services.embeddings import CACHE_ROOT as EMBEDDINGS_CACHE_ROOT
 from backend.services.pdf_generator import create_resume_docx
 
 from backend.services.ri_engine import run_ri_engine
@@ -38,6 +39,9 @@ from backend.services.vector_store import VectorStore
 
 from backend.routers.document_editor import router as document_editor_router
 
+from backend.logging_config import configure_logging
+
+configure_logging()
 
 class JobDescriptionRequest(BaseModel):
     job_description: str = Field(min_length=1)
@@ -119,6 +123,7 @@ def analyze_resume(
 
     try:
         result = run_ri_engine(
+            db=db,
             resume_id=resume_id,
             job_description=request.job_description
         )
@@ -144,17 +149,15 @@ def analyze_resume(
 
     except ValueError as error:
         db.rollback()
-        raise HTTPException(
-            status_code=400,
-            detail=str(error)
-        )
+        raise HTTPException(status_code=400, detail=str(error))
 
     except RuntimeError as error:
         db.rollback()
-        raise HTTPException(
-            status_code=502,
-            detail=str(error)
-        )
+        raise HTTPException(status_code=502, detail=str(error))
+
+    except Exception:
+        db.rollback()
+        raise
 
 @app.post("/resumes/{resume_id}/generate")
 def generate_resume(
@@ -250,9 +253,8 @@ def upload_resume(
     ).all()
 
     if existing_resumes and not replace:
-        return max(
-            existing_resumes,
-            key=lambda resume: resume.created_at
+        return serialize_master_resume(
+            max(existing_resumes, key=lambda resume: resume.created_at)
         )
 
     upload_dir = Path("backend/uploads")
@@ -319,10 +321,16 @@ def upload_resume(
 
         embedding_engine = EmbeddingEngine()
 
-        embedding_engine.generate_embeddings(
+        embeddings = embedding_engine.generate_embeddings(
             db_resume.id,
             cache_result["chunks"]
         )
+
+        print("Generated shape:", embeddings.shape)
+        print("Embedding cache root:", EMBEDDINGS_CACHE_ROOT)
+        print("Vector store cache root:", CACHE_ROOT)
+        print("Embedding file:", EMBEDDINGS_CACHE_ROOT / str(db_resume.id) / "embeddings.npy")
+        print("Embedding file exists:", (EMBEDDINGS_CACHE_ROOT / str(db_resume.id) / "embeddings.npy").exists())
 
         vector_store = VectorStore(db_resume.id)
         vector_store.prepare()
@@ -342,7 +350,7 @@ def upload_resume(
     if existing_resumes:
         remove_resumes(existing_resumes, db)
 
-    return db_resume
+    return serialize_master_resume(db_resume)
 
 @app.delete("/resumes/{resume_id}")
 def delete_resume(
@@ -374,4 +382,13 @@ def api_health():
     return {
         "status": "connected",
         "message": "Frontend and backend are now connected"
+    }
+
+def serialize_master_resume(resume):
+    return {
+        "user_id": resume.user_id,
+        "id": resume.id,
+        "file_path": resume.file_path,
+        "file_name": resume.file_name,
+        "created_at": resume.created_at
     }
