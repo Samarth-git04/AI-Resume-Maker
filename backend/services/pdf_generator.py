@@ -2,362 +2,283 @@ import json
 import subprocess
 from pathlib import Path
 
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-from docx.shared import RGBColor
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Inches, Pt
+from docx.shared import Inches, Pt, RGBColor
 
 from backend.database.models import (
     ExtractedResume,
     ResumeFormatting,
-    ProcessedResume
+    ProcessedResume,
 )
-
+from backend.services.resume_structure import build_resume_structure
 
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "generated"
 
 
 def load_json(data):
     if isinstance(data, str):
-        return json.loads(data)
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError as error:
+            raise ValueError("Stored resume JSON is invalid.") from error
     return data
 
 
 def load_resume_data(db, resume_id):
     extracted = db.query(ExtractedResume).filter(
         ExtractedResume.resume_id == resume_id
-    ).order_by(
-        ExtractedResume.id.desc()
-    ).first()
+    ).order_by(ExtractedResume.id.desc()).first()
 
     formatting = db.query(ResumeFormatting).filter(
         ResumeFormatting.resume_id == resume_id
     ).first()
 
-    if not extracted or not formatting:
+    if not extracted or not formatting or not extracted.extracted_data:
         raise ValueError("Resume data or formatting not found.")
 
+    paragraphs = load_json(extracted.extracted_data)
+    if not isinstance(paragraphs, list):
+        raise ValueError("Extracted resume paragraphs are invalid.")
+
     return {
-        "paragraphs": load_json(extracted.extracted_data),
-        "formatting": formatting.formatting_data
+        "paragraphs": paragraphs,
+        "formatting": formatting.formatting_data or {},
     }
 
 
-def apply_formatting(paragraph, format_data):
-    if not format_data:
-        return
-
-    paragraph_format = paragraph.paragraph_format
-
-    if "sb" in format_data:
-        paragraph_format.space_before = Pt(format_data["sb"])
-
-    if "sa" in format_data:
-        paragraph_format.space_after = Pt(format_data["sa"])
-
-    if "li" in format_data:
-        paragraph_format.left_indent = Inches(format_data["li"])
-
-    if "ri" in format_data:
-        paragraph_format.right_indent = Inches(format_data["ri"])
-
-    if "list" in format_data:
-        list_type = format_data["list"].get("t")
-
-        if list_type == "bullet":
-            paragraph.style = "List Bullet"
-        elif list_type == "numbered":
-            paragraph.style = "List Number"
-
-    run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
-
-    if format_data.get("f"):
-        run.font.name = format_data["f"]
-
-    if format_data.get("z"):
-        run.font.size = Pt(format_data["z"])
-
-    if format_data.get("b") is not None:
-        run.bold = format_data["b"]
-
-    if format_data.get("i") is not None:
-        run.italic = format_data["i"]
-
-    if format_data.get("u") is not None:
-        run.underline = format_data["u"]
-
-
-def build_format_lookup(formatting_data):
+def _format_lookup(formatting_data):
     paragraph_lookup = {
         item["id"]: item
         for item in formatting_data.get("paragraphs", [])
     }
-
-    format_definitions = formatting_data.get("formats", {})
-
-    return paragraph_lookup, format_definitions
+    definitions = formatting_data.get("formats", {})
+    return paragraph_lookup, definitions
 
 
-def add_paragraph(document, text, paragraph_id, formatting_data):
-    paragraph_lookup, format_definitions = build_format_lookup(
-        formatting_data
-    )
+def _apply_formatting(paragraph, format_data):
+    if not format_data:
+        return
 
-    paragraph_info = paragraph_lookup.get(paragraph_id, {})
-    element_type = paragraph_info.get("t")
-    format_id = paragraph_info.get("f")
-    format_data = format_definitions.get(format_id, {})
+    pf = paragraph.paragraph_format
+    if "sb" in format_data:
+        pf.space_before = Pt(format_data["sb"])
+    if "sa" in format_data:
+        pf.space_after = Pt(format_data["sa"])
+    if "li" in format_data:
+        pf.left_indent = Inches(format_data["li"])
+    if "ri" in format_data:
+        pf.right_indent = Inches(format_data["ri"])
+
+    for run in paragraph.runs:
+        if format_data.get("f"):
+            run.font.name = format_data["f"]
+        if format_data.get("z"):
+            run.font.size = Pt(format_data["z"])
+        if format_data.get("b") is not None:
+            run.bold = format_data["b"]
+        if format_data.get("i") is not None:
+            run.italic = format_data["i"]
+        if format_data.get("u") is not None:
+            run.underline = format_data["u"]
+
+
+def _add_source_paragraph(document, text, paragraph_id, formatting_data):
+    paragraph_lookup, definitions = _format_lookup(formatting_data)
+    info = paragraph_lookup.get(paragraph_id, {})
+    element_type = info.get("t")
+    format_data = definitions.get(info.get("f"), {})
 
     if element_type == "subheader":
         paragraph = document.add_heading(text, level=2)
+        paragraph.paragraph_format.keep_with_next = True
     elif element_type == "bullet":
         paragraph = document.add_paragraph(text, style="List Bullet")
     else:
         paragraph = document.add_paragraph(text)
 
-    apply_formatting(paragraph, format_data)
+    _apply_formatting(paragraph, format_data)
     return paragraph
 
-def add_hyperlink(paragraph, text, url, format_data):
-    hyperlink = OxmlElement("w:hyperlink")
-    hyperlink.set(
-        qn("r:id"),
-        paragraph.part.relate_to(
-            url,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
-            is_external=True
-        )
-    )
 
-    run = OxmlElement("w:r")
-    properties = OxmlElement("w:rPr")
+def _configure_document(document):
+    section = document.sections[0]
+    section.top_margin = Inches(0.42)
+    section.bottom_margin = Inches(0.42)
+    section.left_margin = Inches(0.58)
+    section.right_margin = Inches(0.58)
 
-    color = OxmlElement("w:color")
-    color.set(qn("w:val"), "0563C1")
-    properties.append(color)
+    normal = document.styles["Normal"]
+    normal.font.name = "Aptos"
+    normal.font.size = Pt(9)
+    normal.paragraph_format.space_after = Pt(2)
+    normal.paragraph_format.line_spacing = 1.0
 
-    underline = OxmlElement("w:u")
-    underline.set(qn("w:val"), "single")
-    properties.append(underline)
+    for style_name in ("Heading 1", "Heading 2"):
+        style = document.styles[style_name]
+        style.font.name = "Aptos Display"
+        style.font.color.rgb = RGBColor(31, 55, 78)
+        style.paragraph_format.keep_with_next = True
+        style.paragraph_format.space_before = Pt(5)
+        style.paragraph_format.space_after = Pt(2)
 
-    size = OxmlElement("w:sz")
-    size.set(qn("w:val"), "16")
-    properties.append(size)
+    document.styles["Heading 1"].font.size = Pt(11)
+    document.styles["Heading 1"].font.bold = True
+    document.styles["Heading 2"].font.size = Pt(9.5)
+    document.styles["Heading 2"].font.bold = True
 
-    size_complex = OxmlElement("w:szCs")
-    size_complex.set(qn("w:val"), "16")
-    properties.append(size_complex)
 
-    run.append(properties)
+def _add_header(document, paragraphs):
+    header = paragraphs[:3]
+    if not header:
+        return
 
-    text_element = OxmlElement("w:t")
-    text_element.text = text
-    run.append(text_element)
+    name = document.add_paragraph()
+    name.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    name.paragraph_format.space_after = Pt(0)
+    run = name.add_run(header[0]["text"])
+    run.bold = True
+    run.font.name = "Aptos Display"
+    run.font.size = Pt(17)
+    run.font.color.rgb = RGBColor(31, 55, 78)
 
-    hyperlink.append(run)
-    paragraph._p.append(hyperlink)
+    if len(header) > 1:
+        tagline = document.add_paragraph()
+        tagline.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        tagline.paragraph_format.space_after = Pt(1)
+        run = tagline.add_run(header[1]["text"])
+        run.italic = True
+        run.font.size = Pt(9)
 
-def add_fixed_header(document, header_data):
-    paragraphs = header_data["paragraphs"]
-    formatting_data = header_data["formatting"]
+    if len(header) > 2:
+        contact = document.add_paragraph()
+        contact.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        contact.paragraph_format.space_after = Pt(5)
+        run = contact.add_run(header[2]["text"])
+        run.font.size = Pt(8)
 
-    paragraph_lookup, format_definitions = build_format_lookup(
-        formatting_data
-    )
 
-    header_paragraphs = []
-
-    for index, item in enumerate(paragraphs):
-        text = item["text"].strip()
-        paragraph_info = paragraph_lookup.get(item["id"], {})
-
-        if (
-            index > 0
-            and paragraph_info.get("t") == "subheader"
-            and text.isupper()
-        ):
-            break
-
-        header_paragraphs.append({
-            "text": text,
-            "format_data": format_definitions.get(
-                paragraph_info.get("f"), {}
-            )
-        })
-
-    if len(header_paragraphs) < 3:
-        raise ValueError("Expected name, tagline and contact details in header.")
-
-    name = header_paragraphs[0]
-    tagline = header_paragraphs[1]
-    contact_text = header_paragraphs[2]["text"]
-
-    email = "samarthgohel78@gmail.com"
-    linkedin = "linkedin.com/in/samarth-gohel"
-    portfolio = "datascienceportfol.io/samarthgohel"
-
-    location_phone = contact_text
-    for value in (email, linkedin, portfolio):
-        location_phone = location_phone.replace(value, "")
-
-    location_phone = location_phone.replace(" |  | ", " | ")
-    location_phone = location_phone.replace("  ", " ").strip(" |")
-
-    for item in (name, tagline):
-        paragraph = document.add_paragraph(item["text"])
-        apply_formatting(paragraph, item["format_data"])
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    links_paragraph = document.add_paragraph()
-    links_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    links_paragraph.paragraph_format.space_before = Pt(0)
-    links_paragraph.paragraph_format.space_after = Pt(0)
-
-    apply_formatting(
-        links_paragraph,
-        header_paragraphs[2]["format_data"]
-    )
-
-    add_hyperlink(
-        links_paragraph,
-        email,
-        f"mailto:{email}",
-        {}
-    )
-    links_paragraph.add_run(" | ")
-
-    add_hyperlink(
-        links_paragraph,
-        linkedin,
-        f"https://{linkedin}",
-        {}
-    )
-    links_paragraph.add_run(" | ")
-
-    add_hyperlink(
-        links_paragraph,
-        portfolio,
-        f"https://{portfolio}",
-        {}
-    )
-
-    location_paragraph = document.add_paragraph(location_phone)
-
-    paragraph.paragraph_format.space_after = Pt(2)
-    apply_formatting(
-        location_paragraph,
-        header_paragraphs[2]["format_data"]
-    )
-    location_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    links_paragraph.paragraph_format.space_before = Pt(0)
-    links_paragraph.paragraph_format.space_after = Pt(0)
-
-def add_tailored_sections(document, decisions, resume_data):
-    source_paragraphs = resume_data["paragraphs"]
-
-    paragraph_order = {
-        item["id"]: index
-        for index, item in enumerate(source_paragraphs)
-    }
-
-    original_text = {
-        item["id"]: item["text"]
-        for item in source_paragraphs
-    }
-
-    decisions = sorted(
-        decisions,
-        key=lambda item: min(
-            paragraph_order[pid]
-            for pid in item["source_paragraph_ids"]
-        )
-    )
-
-    sections = {}
-
-    for decision in decisions:
-        if decision["action"] == "remove":
+def _decision_lookup(processed_data):
+    lookup = {}
+    for decision in processed_data.get("paragraph_decisions", []):
+        ids = decision.get("source_paragraph_ids", [])
+        if len(ids) != 1:
             continue
+        lookup[ids[0]] = decision
+    return lookup
 
-        section_name = decision["section_name"]
 
-        if section_name not in sections:
-            sections[section_name] = []
+def _selected_project_ids(processed_data, structure):
+    valid = {project["title_id"] for project in structure["projects"]}
+    selected = processed_data.get("selected_project_ids")
 
-        if decision["action"] == "keep":
-            text = original_text[decision["source_paragraph_ids"][0]]
+    if (
+        isinstance(selected, list)
+        and len(selected) == 3
+        and len(set(selected)) == 3
+        and set(selected).issubset(valid)
+    ):
+        return set(selected)
 
-        else:
-            text = decision["rewritten_text"]
+    # Compatibility with older processed records that did not store selection.
+    return {project["title_id"] for project in structure["projects"][:3]}
 
-        sections[section_name].append({
-            "text": text,
-            "paragraph_id": decision["source_paragraph_ids"][0]
-        })
-
-    for section_name, paragraphs in sections.items():
-        if not paragraphs:
-            continue
-
-        document.add_heading(section_name, level=1)
-
-        for item in paragraphs:
-            add_paragraph(
-                document,
-                item["text"],
-                item["paragraph_id"],
-                resume_data["formatting"]
-            )
 
 def create_resume_docx(db, processed_resume_id):
     processed = db.query(ProcessedResume).filter(
         ProcessedResume.id == processed_resume_id
     ).first()
-
     if not processed:
         raise ValueError("Processed resume not found.")
 
     resume_data = load_resume_data(db, processed.resume_id)
     processed_data = load_json(processed.processed_data)
 
+    if not isinstance(processed_data, dict):
+        raise ValueError("Processed resume data is invalid.")
+
+    paragraphs = resume_data["paragraphs"]
+    formatting = resume_data["formatting"]
+    structure = build_resume_structure(paragraphs, formatting)
+
     document = Document()
+    _configure_document(document)
+    _add_header(document, paragraphs)
 
-    add_fixed_header(document, resume_data)
+    decisions = _decision_lookup(processed_data)
+    selected_projects = _selected_project_ids(processed_data, structure)
+    project_title_ids = {
+        project["title_id"] for project in structure["projects"]
+    }
+    project_membership = {}
+    for project in structure["projects"]:
+        for paragraph_id in project["paragraph_ids"]:
+            project_membership[paragraph_id] = project["title_id"]
 
+    profile_id = structure["profile_id"]
     summary = processed_data.get("professional_summary")
+    summary_inserted = False
 
-    if summary:
-        document.add_heading("Professional Summary", level=1)
-        document.add_paragraph(summary)
+    for source in paragraphs[3:]:
+        paragraph_id = source["id"]
+        original_text = source["text"]
 
-    add_tailored_sections(
-        document,
-        processed_data.get("paragraph_decisions", []),
-        resume_data
-    )
+        # The original profile is replaced by the tailored summary, keeping it
+        # in the HIGHLIGHTS section and preventing a duplicate profile.
+        if paragraph_id == profile_id:
+            if summary:
+                document.add_paragraph(summary)
+                summary_inserted = True
+            continue
+
+        # Exclude every paragraph belonging to an unselected project, not just
+        # its title. This prevents orphaned technology and description lines.
+        project_id = project_membership.get(paragraph_id)
+        if project_id and project_id not in selected_projects:
+            continue
+
+        decision = decisions.get(paragraph_id, {})
+        action = decision.get("action", "keep")
+        if action == "remove":
+            continue
+
+        text = (
+            decision.get("rewritten_text")
+            if action == "rewrite" and decision.get("rewritten_text")
+            else original_text
+        )
+
+        paragraph = _add_source_paragraph(
+            document,
+            text,
+            paragraph_id,
+            formatting,
+        )
+
+        # If the profile paragraph was absent from the original structure,
+        # place the summary immediately after the HIGHLIGHTS heading.
+        if (
+            not summary_inserted
+            and summary
+            and paragraph_id in {
+                item["paragraph_id"]
+                for item in structure["sections"]
+                if item["name"] == "HIGHLIGHTS"
+            }
+        ):
+            document.add_paragraph(summary)
+            summary_inserted = True
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
     output_path = OUTPUT_DIR / f"resume_{processed_resume_id}.docx"
-
     document.save(output_path)
-
     return str(output_path)
 
 
 def convert_to_pdf(docx_path: str) -> str:
     docx_path = Path(docx_path).resolve()
-
     if not docx_path.exists():
-        raise FileNotFoundError(
-            f"DOCX file not found: {docx_path}"
-        )
-
-    output_dir = docx_path.parent
+        raise FileNotFoundError(f"DOCX file not found: {docx_path}")
 
     try:
         subprocess.run(
@@ -367,30 +288,20 @@ def convert_to_pdf(docx_path: str) -> str:
                 "--convert-to",
                 "pdf",
                 "--outdir",
-                str(output_dir),
-                str(docx_path)
+                str(docx_path.parent),
+                str(docx_path),
             ],
             check=True,
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=60,
         )
-
     except subprocess.CalledProcessError as error:
-        raise RuntimeError(
-            f"PDF conversion failed: {error.stderr}"
-        ) from error
-
+        raise RuntimeError(f"PDF conversion failed: {error.stderr}") from error
     except subprocess.TimeoutExpired as error:
-        raise RuntimeError(
-            "PDF conversion timed out."
-        ) from error
+        raise RuntimeError("PDF conversion timed out.") from error
 
     pdf_path = docx_path.with_suffix(".pdf")
-
     if not pdf_path.exists():
-        raise RuntimeError(
-            "LibreOffice completed but the PDF was not created."
-        )
-
+        raise RuntimeError("LibreOffice completed but the PDF was not created.")
     return str(pdf_path)

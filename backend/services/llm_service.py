@@ -1,121 +1,104 @@
 import json
-import os
 import logging
+import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from groq import (
-    Groq,
-    AuthenticationError,
+from cerebras.cloud.sdk import (
+    Cerebras,
     APIConnectionError,
     APIStatusError,
-    RateLimitError
+    RateLimitError,
 )
-
 
 logger = logging.getLogger(__name__)
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
-ENV_PATH = BACKEND_DIR / ".env"
+load_dotenv(BACKEND_DIR / ".env")
 
-load_dotenv(ENV_PATH)
+API_KEY = os.getenv("CEREBRAS_API_KEY")
+MODEL = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
 
-GROQ_MODEL = os.getenv(
-    "GROQ_MODEL",
-    "llama-3.3-70b-versatile"
-)
+client = Cerebras(api_key=API_KEY) if API_KEY else None
 
 
-def generate_response(
-    system_prompt: str,
-    user_prompt: str
-) -> dict:
+def generate_response(system_prompt: str, user_prompt: str) -> dict:
+    if (
+        not isinstance(system_prompt, str)
+        or not system_prompt.strip()
+        or not isinstance(user_prompt, str)
+        or not user_prompt.strip()
+    ):
+        raise ValueError("System prompt and user prompt cannot be empty.")
 
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if client is None:
+        raise RuntimeError("CEREBRAS_API_KEY is missing from backend/.env")
 
-    if not api_key:
-        logger.error("GROQ_API_KEY is missing.")
-        raise RuntimeError("GROQ_API_KEY is not configured.")
-
-    if not system_prompt.strip() or not user_prompt.strip():
-        logger.error("Empty system or user prompt received.")
-        raise ValueError("Prompts cannot be empty.")
-
-    logger.info("Initializing Groq client.")
-    logger.info("Using Groq model: %s", GROQ_MODEL)
-    logger.info("Environment file: %s", ENV_PATH)
-    logger.info("API key configured: True")
+    started = time.perf_counter()
+    logger.info(
+        "Cerebras request started. model=%s system_chars=%d user_chars=%d",
+        MODEL,
+        len(system_prompt),
+        len(user_prompt),
+    )
 
     try:
-        client = Groq(api_key=api_key)
-
-        logger.info("Sending request to Groq.")
-
         response = client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt
-                }
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
             temperature=0.2,
-            max_tokens=4096,
-            response_format={"type": "json_object"}
+            max_completion_tokens=8192,
+            response_format={"type": "json_object"},
         )
 
-        content = response.choices[0].message.content
+        choice = response.choices[0]
+        content = choice.message.content
 
-        if not content:
-            logger.error("Groq returned an empty response.")
-            raise ValueError("Groq returned an empty response.")
+        # Never log the full model message: it may contain personal resume data
+        # or hidden reasoning. Log only safe operational metadata.
+        logger.info("Cerebras finish reason: %s", choice.finish_reason)
 
-        result = json.loads(content)
+        if not content or not content.strip():
+            raise ValueError("Cerebras returned an empty response.")
 
-        logger.info("Groq request completed successfully.")
+        try:
+            result = json.loads(content)
+        except json.JSONDecodeError as error:
+            logger.exception("Cerebras returned invalid JSON.")
+            raise ValueError(f"Cerebras returned invalid JSON: {error}") from error
 
+        if not isinstance(result, dict):
+            raise ValueError("Cerebras response must be a JSON object.")
+
+        usage = response.usage
+        logger.info(
+            "Cerebras request completed. model=%s duration=%.2fs "
+            "prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+            MODEL,
+            time.perf_counter() - started,
+            getattr(usage, "prompt_tokens", None),
+            getattr(usage, "completion_tokens", None),
+            getattr(usage, "total_tokens", None),
+        )
         return result
 
-    except AuthenticationError as error:
-        logger.error(
-            "Groq authentication failed. HTTP status: %s",
-            error.status_code
-        )
-        raise RuntimeError(
-            "Groq rejected the API key. Check GROQ_API_KEY."
-        ) from error
-
     except RateLimitError as error:
-        logger.error(
-            "Groq rate limit exceeded. HTTP status: %s",
-            error.status_code
-        )
-        raise RuntimeError(
-            "Groq rate limit exceeded."
-        ) from error
-
-    except APIConnectionError:
-        logger.exception("Could not connect to Groq API.")
-        raise RuntimeError(
-            "Could not connect to Groq API."
-        )
-
+        logger.exception("Cerebras rate limit exceeded.")
+        raise RuntimeError(f"Cerebras rate limit exceeded: {error}") from error
+    except APIConnectionError as error:
+        logger.exception("Cerebras API connection failed.")
+        raise RuntimeError(f"Could not connect to Cerebras API: {error}") from error
     except APIStatusError as error:
-        logger.error(
-            "Groq API returned HTTP %s: %s",
-            error.status_code,
-            error.message
-        )
+        logger.exception("Cerebras API returned status code %s.", error.status_code)
         raise RuntimeError(
-            f"Groq API request failed: HTTP {error.status_code}"
+            f"Cerebras API error ({error.status_code}): {error}"
         ) from error
-
-    except json.JSONDecodeError as error:
-        logger.exception("Groq returned invalid JSON.")
-        raise ValueError(
-            "Groq returned an invalid JSON response."
-        ) from error
+    except (ValueError, RuntimeError):
+        raise
+    except Exception:
+        logger.exception("Unexpected error during Cerebras request.")
+        raise

@@ -10,102 +10,65 @@ from backend.services.resume_ext import extract_rag_formatting
 logger = logging.getLogger(__name__)
 
 
-def build_ai_context(
-    db: Session,
-    resume_id: int,
-    job_description: str
-) -> dict:
+def build_ai_context(db: Session, resume_id: int, job_description: str) -> dict:
+    """Build complete, source-ordered resume context plus JD relevance metadata.
 
-    logger.info("Building AI context for resume_id=%s", resume_id)
+    FAISS is used to identify relevance, not to decide which source paragraphs
+    are allowed into the document. Keeping the complete source is essential:
+    titles, employers, dates and section headings often do not rank highly on
+    their own, but must remain attached to the content they describe.
+    """
+    if not isinstance(job_description, str) or not job_description.strip():
+        raise ValueError("Job description cannot be empty.")
 
-    retrieval_data = retrieve_for_job(
-        db,
-        resume_id,
-        job_description
-    )
+    retrieval_data = retrieve_for_job(db, resume_id, job_description)
+    source_paragraphs = get_source_paragraphs(db, resume_id)
 
-    logger.info(
-        "JD retrieval completed. Requirements=%s, unique_paragraphs=%s",
-        len(retrieval_data.get("requirements", [])),
-        len(retrieval_data.get("unique_paragraphs", []))
-    )
-
-    source_paragraphs = get_source_paragraphs(
-        db,
-        resume_id
-    )
-
-    logger.info(
-        "Loaded %s source paragraphs for resume_id=%s",
-        len(source_paragraphs),
-        resume_id
-    )
-
-    source_lookup = {
-        paragraph["id"]: paragraph["text"]
-        for paragraph in source_paragraphs
+    matched_lookup = {
+        item["paragraph_id"]: item.get("matched_requirements", [])
+        for item in retrieval_data.get("unique_paragraphs", [])
     }
 
     resume_paragraphs = []
+    seen_ids = set()
 
-    for paragraph in retrieval_data["unique_paragraphs"]:
+    for item in source_paragraphs:
+        paragraph_id = item.get("id")
+        text = item.get("text")
 
-        paragraph_id = paragraph["paragraph_id"]
+        if not paragraph_id or not isinstance(text, str) or not text.strip():
+            continue
+        if paragraph_id in seen_ids:
+            raise ValueError(f"Duplicate source paragraph ID: {paragraph_id}")
 
-        if paragraph_id not in source_lookup:
-            logger.error(
-                "Retrieved paragraph %s not found in source data",
-                paragraph_id
-            )
-            raise ValueError(
-                f"Retrieved paragraph not found: {paragraph_id}"
-            )
-
+        seen_ids.add(paragraph_id)
         resume_paragraphs.append({
             "paragraph_id": paragraph_id,
-            "text": source_lookup[paragraph_id],
-            "matched_requirements": paragraph["matched_requirements"]
+            "text": text.strip(),
+            "matched_requirements": matched_lookup.get(paragraph_id, [])
         })
-
-    retrieved_paragraph_ids = [
-        paragraph["paragraph_id"]
-        for paragraph in resume_paragraphs
-    ]
 
     formatting_record = db.query(ResumeFormatting).filter(
         ResumeFormatting.resume_id == resume_id
     ).first()
 
     if not formatting_record:
-        logger.error(
-            "Formatting data missing for resume_id=%s",
-            resume_id
-        )
-        raise ValueError(
-            f"No formatting data found for resume_id={resume_id}"
-        )
+        raise ValueError(f"No formatting data found for resume_id={resume_id}")
 
-    resume_formatting = extract_rag_formatting(
+    formatting = extract_rag_formatting(
         formatting_record.formatting_data,
-        retrieved_paragraph_ids
+        [item["paragraph_id"] for item in resume_paragraphs]
     )
-
-    formatting_paragraphs = resume_formatting.get("paragraphs", [])
 
     logger.info(
-        "Context built. Resume paragraphs=%s, formatting paragraphs=%s",
+        "Complete resume context built. resume_id=%s source_paragraphs=%s retrieved=%s",
+        resume_id,
         len(resume_paragraphs),
-        len(formatting_paragraphs)
+        len(matched_lookup)
     )
 
-    if not resume_paragraphs:
-        logger.warning(
-            "No resume paragraphs retrieved for resume_id=%s",
-            resume_id
-        )
-
     return {
-        "job_requirements": retrieval_data["requirements"],
+        "job_requirements": retrieval_data.get("requirements", []),
         "resume_paragraphs": resume_paragraphs,
-        "resume_formatting": resume_formatting
+        "resume_formatting": formatting
     }
