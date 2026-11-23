@@ -806,6 +806,55 @@
   }
 }
 
+.editor-workspace {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100vh;
+  background: #f4f5f7;
+  overflow: hidden;
+}
+
+.document-editor-container {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+}
+
+.editor-toolbar {
+  height: 48px;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0 20px;
+  background: white;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.editor-toolbar a {
+  text-decoration: none;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.onlyoffice-container {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+}
+
+.onlyoffice-container > div {
+  height: 100% !important;
+  width: 100% !important;
+}
+
+.editor-loading,
+.editor-error {
+  padding: 24px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

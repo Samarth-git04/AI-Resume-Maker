@@ -34,22 +34,22 @@ function DocumentEditorComponent({ filename }) {
   }, [filename]);
 
   if (error) {
-    return <p>Error: {error}</p>;
+    return <p className="editor-error">Error: {error}</p>;
   }
 
   if (!config) {
-    return <p>Loading document editor...</p>;
+    return <p className="editor-loading">Loading document editor...</p>;
   }
 
   return (
-    <div>
-      <div style={{ marginBottom: "15px" }}>
+    <div className="document-editor-container">
+      <div className="editor-toolbar">
         <a href={getResumeDownloadUrl(filename)} download>
-          <button type="button">Download Resume</button>
+          Download Resume
         </a>
       </div>
 
-      <div style={{ height: "850px", width: "100%" }}>
+      <div className="onlyoffice-container">
         <DocumentEditor
           id="onlyoffice-editor"
           documentServerUrl="http://localhost:8080"

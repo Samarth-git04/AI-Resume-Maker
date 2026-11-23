@@ -175,6 +175,14 @@ function App() {
     }
   }
 
+  if (generatedFilename) {
+    return (
+      <div className="editor-workspace">
+        <DocumentEditorComponent filename={generatedFilename} />
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       <header className="topbar">
