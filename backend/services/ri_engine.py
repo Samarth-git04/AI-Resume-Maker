@@ -1,5 +1,6 @@
 import logging
 import re
+import json
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -9,7 +10,16 @@ from backend.services.llm_service import generate_response
 from backend.services.resume_structure import build_resume_structure
 from backend.services.resume_text import clean_resume_text, comparison_text
 
+
 logger = logging.getLogger(__name__)
+
+
+PROJECT_REQUIREMENT_WEIGHTS = {
+    "required": 1.5,
+    "preferred": 1.15,
+    "unspecified": 1.0,
+    "not_required": 0.0,
+}
 
 
 def _numbers(text: str) -> set:
@@ -31,29 +41,115 @@ def _safe_rewrite(original: str, proposed: Any) -> str | None:
     return proposed
 
 
-def _fallback_project_selection(projects: list, paragraph_lookup: dict) -> list:
+def _score_project(
+    project: dict,
+    paragraph_lookup: dict,
+    requirements: list,
+) -> float:
+    """
+    Score a project using its best FAISS similarity score for each
+    job requirement.
+
+    Required requirements receive the highest weight. Preferred
+    requirements receive a lower weight. Not-required requirements
+    do not contribute to the score.
+
+    Missing requirement matches receive a score of zero.
+    """
+
+    requirement_scores = {}
+
+    for paragraph_id in project["paragraph_ids"]:
+        paragraph = paragraph_lookup.get(paragraph_id, {})
+
+        for match in paragraph.get("matched_requirements", []):
+            requirement_id = match.get("requirement_id")
+            score = match.get("score")
+
+            if (
+                not requirement_id
+                or not isinstance(score, (int, float))
+            ):
+                continue
+
+            score = float(score)
+
+            current_score = requirement_scores.get(requirement_id)
+
+            if current_score is None or score > current_score:
+                requirement_scores[requirement_id] = score
+
+    weighted_score = 0.0
+    total_weight = 0.0
+    covered_weight = 0.0
+
+    for requirement in requirements:
+        requirement_id = requirement.get("requirement_id")
+        priority = requirement.get("priority", "unspecified")
+
+        weight = PROJECT_REQUIREMENT_WEIGHTS.get(
+            priority,
+            1.0,
+        )
+
+        if weight == 0:
+            continue
+
+        total_weight += weight
+
+        score = requirement_scores.get(requirement_id, 0.0)
+
+        weighted_score += score * weight
+
+        if requirement_id in requirement_scores:
+            covered_weight += weight
+
+    if total_weight == 0:
+        return 0.0
+
+    average_similarity = weighted_score / total_weight
+    requirement_coverage = covered_weight / total_weight
+
+    # Similarity determines relevance. Coverage rewards projects
+    # that match a wider range of JD requirements.
+    return average_similarity + (0.10 * requirement_coverage)
+
+
+def _rank_projects(
+    projects: list,
+    paragraph_lookup: dict,
+    requirements: list,
+) -> list:
+    """
+    Rank projects deterministically.
+
+    The AI receives only the three highest-ranked projects.
+    Ties are resolved using the original project title ID.
+    """
+
     ranked = []
 
     for project in projects:
-        scores = []
+        score = _score_project(
+            project,
+            paragraph_lookup,
+            requirements,
+        )
 
-        for paragraph_id in project["paragraph_ids"]:
-            paragraph = paragraph_lookup.get(paragraph_id, {})
+        ranked.append({
+            "project": project,
+            "score": score,
+        })
 
-            for match in paragraph.get("matched_requirements", []):
-                score = match.get("score")
+    ranked.sort(
+        key=lambda item: (
+            -item["score"],
+            item["project"]["title_id"],
+        )
+    )
 
-                if isinstance(score, (int, float)):
-                    scores.append(float(score))
+    return ranked
 
-        ranked.append((
-            max(scores) if scores else 0.0,
-            sum(scores) / len(scores) if scores else 0.0,
-            project["title_id"]
-        ))
-
-    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [item[2] for item in ranked[:3]]
 
 def _find_key_achievements(records: list) -> list:
     achievement_heading_found = False
@@ -72,7 +168,13 @@ def _find_key_achievements(records: list) -> list:
                 break
             continue
 
-        if comparison_text(text).rstrip(":").strip() == "key achievements":
+        normalized = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            comparison_text(text),
+        ).strip()
+
+        if normalized == "key achievements":
             achievement_heading_found = True
             continue
 
@@ -86,6 +188,7 @@ def _find_key_achievements(records: list) -> list:
             achievement_ids.append(record["id"])
 
     return achievement_ids
+
 
 def _experience_context(records: list) -> tuple[list, list, str]:
     experience_records = [
@@ -152,13 +255,20 @@ def _company_is_supported(
         original_achievement,
     )
 
-    if prefix_match and company_key == comparison_text(prefix_match.group(1)):
+    if (
+        prefix_match
+        and company_key == comparison_text(prefix_match.group(1))
+    ):
         return True
 
     return False
 
 
-def _achievement_body(original: str, proposed: Any, company: str) -> str | None:
+def _achievement_body(
+    original: str,
+    proposed: Any,
+    company: str,
+) -> str | None:
     if not isinstance(proposed, str) or not proposed.strip():
         return None
 
@@ -186,6 +296,13 @@ def _normalise_achievements(
     company_candidates: list,
     experience_text: str,
 ) -> list:
+    """
+    Validate the three achievements selected by the AI.
+
+    There is intentionally no Python fallback. The AI must select
+    three distinct source achievements and provide supported employers.
+    """
+
     if not isinstance(proposed, list) or len(proposed) != 3:
         return []
 
@@ -203,16 +320,18 @@ def _normalise_achievements(
         if (
             paragraph_id not in valid_ids
             or paragraph_id in seen_ids
-            or not _company_is_supported(
-                company,
-                company_candidates,
-                experience_text,
-                paragraph_lookup[paragraph_id]["text"],
-            )
         ):
             return []
 
         original = paragraph_lookup[paragraph_id]["text"]
+
+        if not _company_is_supported(
+            company,
+            company_candidates,
+            experience_text,
+            original,
+        ):
+            return []
 
         body = _achievement_body(
             original,
@@ -234,83 +353,29 @@ def _normalise_achievements(
     return selected if len(selected) == 3 else []
 
 
-def _fallback_achievements(
-    achievement_ids: list,
-    paragraph_lookup: dict,
-    company_candidates: list,
-    experience_text: str,
-) -> list:
-    ranked = []
-
-    for paragraph_id in achievement_ids:
-        paragraph = paragraph_lookup[paragraph_id]
-
-        scores = [
-            float(match["score"])
-            for match in paragraph.get("matched_requirements", [])
-            if isinstance(match.get("score"), (int, float))
-        ]
-
-        ranked.append((
-            max(scores) if scores else 0.0,
-            sum(scores) / len(scores) if scores else 0.0,
-            paragraph_id,
-        ))
-
-    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    selected = []
-
-    for _, _, paragraph_id in ranked:
-        original = paragraph_lookup[paragraph_id]["text"]
-
-        prefix_match = re.match(
-            r"^\s*(.{2,70}?)\s*:\s*(.+)$",
-            original,
-        )
-
-        company = None
-        body = original
-
-        if prefix_match and _company_is_supported(
-            prefix_match.group(1),
-            company_candidates,
-            experience_text,
-            original,
-        ):
-            company = clean_resume_text(prefix_match.group(1))
-            body = clean_resume_text(prefix_match.group(2))
-
-        elif len(company_candidates) == 1:
-            company = company_candidates[0]
-
-        if not company:
-            continue
-
-        selected.append({
-            "source_paragraph_id": paragraph_id,
-            "company": company,
-            "text": f"{company}: {body}",
-        })
-
-        if len(selected) == 3:
-            return selected
-
-    return []
-
-
 def _normalise_model_decisions(
     model_decisions: Any,
     records: list,
     paragraph_lookup: dict,
     requirements: list,
-    protected_ids: set,
+    allowed_ids: set,
 ) -> dict:
-    valid_ids = {item["id"] for item in records}
-    requirement_ids = {item["requirement_id"] for item in requirements}
+    """
+    Validate AI decisions.
+
+    The AI may keep, rewrite or remove supplied paragraphs.
+    Experience bullets are no longer protected from removal.
+    """
+
+    requirement_ids = {
+        item["requirement_id"]
+        for item in requirements
+    }
+
     result = {}
 
     if not isinstance(model_decisions, list):
-        model_decisions = []
+        return result
 
     for decision in model_decisions:
         if not isinstance(decision, dict):
@@ -323,7 +388,10 @@ def _normalise_model_decisions(
 
         paragraph_id = ids[0]
 
-        if paragraph_id not in valid_ids or paragraph_id in result:
+        if (
+            paragraph_id not in allowed_ids
+            or paragraph_id in result
+        ):
             continue
 
         source = paragraph_lookup[paragraph_id]
@@ -331,9 +399,6 @@ def _normalise_model_decisions(
 
         if action not in {"keep", "rewrite", "remove"}:
             continue
-
-        if paragraph_id in protected_ids and action == "remove":
-            action = "keep"
 
         matched = decision.get("matched_requirements", [])
 
@@ -353,8 +418,8 @@ def _normalise_model_decisions(
             )
 
             if rewritten is None:
-                action = "keep"
-                rewritten = None
+                continue
+
         else:
             rewritten = None
 
@@ -369,37 +434,46 @@ def _normalise_model_decisions(
     return result
 
 
-def run_ri_engine(db: Session, resume_id: int, job_description: str) -> dict:
-    if not isinstance(job_description, str) or not job_description.strip():
+def run_ri_engine(
+    db: Session,
+    resume_id: int,
+    job_description: str,
+) -> dict:
+
+    if (
+        not isinstance(job_description, str)
+        or not job_description.strip()
+    ):
         raise ValueError("Job description cannot be empty.")
 
-    context = build_ai_context(db, resume_id, job_description)
+    context = build_ai_context(
+        db,
+        resume_id,
+        job_description,
+    )
+
     paragraphs = context["resume_paragraphs"]
     formatting = context["resume_formatting"]
+    requirements = context["job_requirements"]
 
     if len(paragraphs) < 4:
-        raise ValueError("The uploaded resume does not contain enough content.")
+        raise ValueError(
+            "The uploaded resume does not contain enough content."
+        )
 
-    structure = build_resume_structure(paragraphs, formatting)
+    structure = build_resume_structure(
+        paragraphs,
+        formatting,
+    )
+
     records = structure["records"]
     projects = structure["projects"]
     profile_id = structure["profile_id"]
 
-    # print("\n--- RESUME STRUCTURE DEBUG ---")
-    # for record in records:
-    #     text = str(record.get("text", ""))
-    #     if "achievement" in text.lower() or "highlight" in str(record.get("section", "")).lower():
-    #         print({
-    #             "id": record.get("id"),
-    #             "section": record.get("section"),
-    #             "role": record.get("role"),
-    #             "text": text
-    #         })
-    # print("--- END DEBUG ---\n")
-
     if len(projects) < 3:
         raise ValueError(
-            f"At least three identifiable project titles are required; found {len(projects)}."
+            "At least three identifiable project titles are required; "
+            f"found {len(projects)}."
         )
 
     paragraph_lookup = {
@@ -422,23 +496,59 @@ def run_ri_engine(db: Session, resume_id: int, job_description: str) -> dict:
 
     if len(achievement_ids) < 3:
         raise ValueError(
-            "At least three bullet points are required under HIGHLIGHTS > KEY ACHIEVEMENTS."
+            "At least three bullet points are required under "
+            "HIGHLIGHTS > KEY ACHIEVEMENTS."
         )
 
     experience_paragraphs, company_candidates, experience_text = (
         _experience_context(records)
     )
 
-    experience_ids = {
-        item["id"]
-        for item in experience_paragraphs
+    achievement_id_set = set(achievement_ids)
+
+    # ---------------------------------------------------------
+    # 1. Score projects in Python and select the top three.
+    # ---------------------------------------------------------
+
+    ranked_projects = _rank_projects(
+        projects,
+        paragraph_lookup,
+        requirements,
+    )
+
+    selected_project_entries = ranked_projects[:3]
+
+    selected_projects = [
+        item["project"]
+        for item in selected_project_entries
+    ]
+
+    selected_project_ids = [
+        project["title_id"]
+        for project in selected_projects
+    ]
+
+    selected_project_paragraph_ids = {
+        paragraph_id
+        for project in selected_projects
+        for paragraph_id in project["paragraph_ids"]
     }
 
-    achievement_id_set = set(achievement_ids)
+    for item in selected_project_entries:
+        logger.info(
+            "Project relevance score. resume_id=%s project=%s score=%.4f",
+            resume_id,
+            item["project"]["title"],
+            item["score"],
+        )
+
+    # ---------------------------------------------------------
+    # 2. Build AI context using only the selected projects.
+    # ---------------------------------------------------------
 
     project_payload = []
 
-    for project in projects:
+    for project in selected_projects:
         project_payload.append({
             "title_id": project["title_id"],
             "title": project["title"],
@@ -446,7 +556,9 @@ def run_ri_engine(db: Session, resume_id: int, job_description: str) -> dict:
                 {
                     "id": paragraph_id,
                     "text": paragraph_lookup[paragraph_id]["text"],
-                    "matched_requirements": paragraph_lookup[paragraph_id]["matched_requirements"],
+                    "matched_requirements": paragraph_lookup[
+                        paragraph_id
+                    ]["matched_requirements"],
                 }
                 for paragraph_id in project["paragraph_ids"]
                 if paragraph_id != project["title_id"]
@@ -458,7 +570,9 @@ def run_ri_engine(db: Session, resume_id: int, job_description: str) -> dict:
             "id": item["id"],
             "section": item["section"],
             "text": item["text"],
-            "matched_requirements": paragraph_lookup[item["id"]]["matched_requirements"],
+            "matched_requirements": paragraph_lookup[
+                item["id"]
+            ]["matched_requirements"],
         }
         for item in records
         if (
@@ -468,22 +582,31 @@ def run_ri_engine(db: Session, resume_id: int, job_description: str) -> dict:
         )
     ]
 
+    # Only descriptions belonging to the selected three projects
+    # are supplied for AI editing.
     project_content_payload = [
         {
             "id": item["id"],
             "section": item["section"],
             "text": item["text"],
-            "matched_requirements": paragraph_lookup[item["id"]]["matched_requirements"],
+            "matched_requirements": paragraph_lookup[
+                item["id"]
+            ]["matched_requirements"],
         }
         for item in records
-        if item["role"] == "project_content"
+        if (
+            item["role"] == "project_content"
+            and item["id"] in selected_project_paragraph_ids
+        )
     ]
 
     achievement_payload = [
         {
             "id": paragraph_id,
             "text": paragraph_lookup[paragraph_id]["text"],
-            "matched_requirements": paragraph_lookup[paragraph_id]["matched_requirements"],
+            "matched_requirements": paragraph_lookup[
+                paragraph_id
+            ]["matched_requirements"],
         }
         for paragraph_id in achievement_ids
     ]
@@ -494,39 +617,126 @@ def run_ri_engine(db: Session, resume_id: int, job_description: str) -> dict:
         else ""
     )
 
-    system_prompt = """
-You are a conservative professional resume editor. The supplied resume is the
-only source of candidate facts.
+    # ---------------------------------------------------------
+    # 3. AI instructions.
+    # ---------------------------------------------------------
 
-Your tasks:
-1. Write a concise professional summary based only on the original profile and
-   factual resume content. Do not infer years of experience, seniority, metrics,
-   qualifications, employers, dates, tools or achievements.
-2. Select exactly THREE key achievements from key_achievements. Select the
-   three most relevant to the job description. Do not invent or combine separate
-   achievements. For each selected achievement, return its original paragraph
-   ID, the exact employer/company name supported by the experience section,
-   and a concise what_i_did statement. The final format will be
-   "Company: What I did". Use a company name from company_candidates, or an
-   employer name explicitly present in the experience text. Never use a job
-   title as the company name. Preserve the achievement's factual meaning.
-3. Edit the supplied editable paragraphs and project description paragraphs.
-   Use keep, rewrite or remove. Rewrite only when it improves relevance or
-   clarity.
-4. For EVERY bullet under the EXPERIENCE section, retain the point. You may
-   keep it unchanged or rewrite it, and you may use a mixture of unchanged and
-   rewritten bullets across both jobs. Do not remove any experience bullet.
-   Keep each bullet's original responsibility, scope and factual meaning.
-5. Preserve technical detail and all numeric claims. Never add new numbers,
-   dates, percentages, quantities, employers, tools, responsibilities or outcomes.
-6. Never invent a skill merely because it appears in the job description.
-7. Do not create section names, headings, job titles, employer names or dates.
-8. Do not merge paragraphs. Do not return decisions for paragraph IDs not supplied.
+    system_prompt = """
+You are a professional resume editor.
+
+The supplied resume is the only source of candidate facts.
+The supplied job description determines relevance and priority.
+
+IMPORTANT: Do not invent facts, experience, employers, dates,
+qualifications, tools, metrics, responsibilities or outcomes.
+
+TASK 1 - PROFESSIONAL SUMMARY
+
+Write a concise professional summary based on the original profile
+and factual resume content.
+
+Do not infer years of experience, seniority, qualifications,
+metrics, tools or achievements.
+
+TASK 2 - KEY ACHIEVEMENTS
+
+Select EXACTLY THREE achievements from key_achievements.
+
+You must make the selection yourself based on relevance to the
+job description.
+
+Do not select achievements based on their order in the resume.
+Prioritise achievements that demonstrate the most relevant skills,
+responsibilities, technical capabilities and outcomes.
+
+Do not invent or combine separate achievements.
+
+For each selected achievement:
+- Return its original source paragraph ID.
+- Return the exact employer/company name supported by the
+  experience section.
+- Return a concise what_i_did statement.
+- Preserve the original achievement's factual meaning.
+- Preserve every numerical claim.
+
+The final format will be:
+"Company: What I did"
+
+Use a company name from company_candidates or an employer name
+explicitly present in experience_text.
+
+Never use a job title as the company name.
+
+You must return three different source paragraph IDs.
+
+TASK 3 - EXPERIENCE BULLETS
+
+Review every supplied experience paragraph against the job description.
+
+You may:
+- Keep a bullet unchanged.
+- Rewrite a bullet to improve relevance, clarity or impact.
+- Remove a bullet if it is irrelevant, weak, repetitive or does
+  not meaningfully support the target role.
+
+Do NOT automatically retain every bullet.
+
+Actively remove bullets that add little value for this particular JD.
+Prioritise the strongest and most relevant responsibilities,
+technical work and outcomes.
+
+Do not remove every bullet belonging to an employer. Retain at least
+the strongest relevant point for each employer where possible.
+
+Do not change the factual meaning of retained bullets.
+
+TASK 4 - PROJECT DESCRIPTIONS
+
+The supplied project_groups contain the THREE projects already
+selected by Python using JD relevance scores.
+
+You must NOT select different projects.
+
+Rewrite or remove project description paragraphs where doing so
+improves relevance to the JD.
+
+You may:
+- Keep a project paragraph unchanged.
+- Rewrite a project paragraph.
+- Remove an irrelevant or repetitive project bullet.
+
+Do not invent project details, technologies, metrics or outcomes.
+
+Every project description paragraph supplied must receive exactly
+one decision.
+
+TASK 5 - OTHER EDITABLE PARAGRAPHS
+
+Review every supplied editable paragraph.
+
+Use keep, rewrite or remove according to its relevance and value
+for the target job.
+
+Do not remove factual information simply because it is not an exact
+keyword match.
+
+TASK 6 - FACTUAL AND FORMATTING RULES
+
+- Preserve technical detail and all numerical claims.
+- Never add new numbers, dates, percentages or quantities.
+- Never invent employers, tools, responsibilities or outcomes.
+- Never invent a skill because it appears in the job description.
+- Do not create section names, headings, job titles, employer names
+  or dates.
+- Do not merge paragraphs.
+- Do not return decisions for paragraph IDs that were not supplied.
+- Use one source paragraph ID per decision.
+- Do not return section_name.
 
 Return one JSON object with exactly these keys:
+
 {
   "professional_summary": "string",
-  "selected_project_ids": ["P1", "P2", "P3"],
   "selected_achievements": [
     {
       "source_paragraph_id": "P4",
@@ -545,17 +755,23 @@ Return one JSON object with exactly these keys:
   "changes_summary": ["short explanation"]
 }
 
-Return exactly three selected_achievements with three distinct source paragraph IDs.
-Every editable paragraph ID supplied must have exactly one decision.
-Every project description paragraph supplied must have exactly one decision.
-Use one source paragraph ID per decision. Do not return section_name.
-For keep and remove, rewritten_text must be null. For rewrite, provide text.
-For experience bullets, use only keep or rewrite.
-Do not add markdown or text outside the JSON object.
+STRICT OUTPUT REQUIREMENTS
+
+- Return exactly three selected_achievements.
+- Use three distinct source paragraph IDs.
+- Every editable paragraph ID supplied must have exactly one decision.
+- Every project description paragraph supplied must have exactly one decision.
+- Use one source paragraph ID per decision.
+- For keep and remove, rewritten_text must be null.
+- For rewrite, provide the rewritten text.
+- For experience bullets, keep, rewrite and remove are all allowed.
+- Do not return selected_project_ids. Python has already selected
+  the projects.
+- Do not add markdown or text outside the JSON object.
 """.strip()
 
     user_payload = {
-        "job_requirements": context["job_requirements"],
+        "job_requirements": requirements,
         "original_profile": profile_text,
         "company_candidates": company_candidates,
         "experience_text": experience_text,
@@ -566,36 +782,26 @@ Do not add markdown or text outside the JSON object.
         "project_description_paragraphs": project_content_payload,
     }
 
-    import json
+    # ---------------------------------------------------------
+    # 4. Generate AI decisions.
+    # ---------------------------------------------------------
 
     response = generate_response(
         system_prompt=system_prompt,
-        user_prompt=json.dumps(user_payload, ensure_ascii=False),
+        user_prompt=json.dumps(
+            user_payload,
+            ensure_ascii=False,
+        ),
     )
 
     if not isinstance(response, dict):
-        raise ValueError("The resume editor returned an invalid response.")
-
-    valid_project_ids = {
-        item["title_id"]
-        for item in projects
-    }
-
-    selected_projects = response.get("selected_project_ids")
-
-    if (
-        not isinstance(selected_projects, list)
-        or len(selected_projects) != 3
-        or len(set(selected_projects)) != 3
-        or not set(selected_projects).issubset(valid_project_ids)
-    ):
-        selected_projects = _fallback_project_selection(
-            projects,
-            paragraph_lookup,
+        raise ValueError(
+            "The resume editor returned an invalid response."
         )
 
-    if len(selected_projects) != 3:
-        raise ValueError("Could not select exactly three projects.")
+    # ---------------------------------------------------------
+    # 5. Validate AI-selected achievements.
+    # ---------------------------------------------------------
 
     selected_achievements = _normalise_achievements(
         response.get("selected_achievements"),
@@ -606,25 +812,28 @@ Do not add markdown or text outside the JSON object.
     )
 
     if len(selected_achievements) != 3:
-        selected_achievements = _fallback_achievements(
-            achievement_ids,
-            paragraph_lookup,
-            company_candidates,
-            experience_text,
+        raise ValueError(
+            "The AI did not return exactly three valid key achievements. "
+            "Each achievement must reference a different original "
+            "achievement and use an employer supported by the resume."
         )
 
-    if len(selected_achievements) != 3:
-        raise ValueError(
-            "The AI could not select and format exactly three achievements "
-            "with employer names supported by the uploaded resume."
-        )
+    # ---------------------------------------------------------
+    # 6. Validate the professional summary.
+    # ---------------------------------------------------------
 
     summary = response.get("professional_summary")
 
     if not isinstance(summary, str) or not summary.strip():
         summary = profile_text
+
     else:
-        summary = re.sub(r"\s+", " ", summary).strip()
+        summary = re.sub(
+            r"\s+",
+            " ",
+            summary,
+        ).strip()
+
         all_source_text = " ".join(
             item["text"]
             for item in paragraphs
@@ -648,13 +857,40 @@ Do not add markdown or text outside the JSON object.
         if len(summary.split()) > 65:
             summary = profile_text
 
+    # ---------------------------------------------------------
+    # 7. Validate paragraph decisions.
+    # ---------------------------------------------------------
+
+    required_decision_ids = {
+        item["id"]
+        for item in editable_payload
+    } | {
+        item["id"]
+        for item in project_content_payload
+    }
+
     model_decisions = _normalise_model_decisions(
         response.get("paragraph_decisions"),
         records,
         paragraph_lookup,
-        context["job_requirements"],
-        experience_ids,
+        requirements,
+        required_decision_ids,
     )
+
+    missing_decisions = (
+        required_decision_ids - set(model_decisions)
+    )
+
+    if missing_decisions:
+        raise ValueError(
+            "The AI did not return a valid decision for every supplied "
+            "editable paragraph. Missing paragraph IDs: "
+            + ", ".join(sorted(missing_decisions))
+        )
+
+    # ---------------------------------------------------------
+    # 8. Apply AI-selected achievements.
+    # ---------------------------------------------------------
 
     achievement_lookup = {
         item["source_paragraph_id"]: item["text"]
@@ -666,25 +902,27 @@ Do not add markdown or text outside the JSON object.
             achievement_text = achievement_lookup[paragraph_id]
             original_text = paragraph_lookup[paragraph_id]["text"]
 
+            is_unchanged = (
+                comparison_text(achievement_text)
+                == comparison_text(original_text)
+            )
+
             model_decisions[paragraph_id] = {
                 "source_paragraph_ids": [paragraph_id],
-                "action": (
-                    "keep"
-                    if comparison_text(achievement_text) == comparison_text(original_text)
-                    else "rewrite"
-                ),
+                "action": "keep" if is_unchanged else "rewrite",
                 "section_name": "HIGHLIGHTS",
                 "rewritten_text": (
-                    None
-                    if comparison_text(achievement_text) == comparison_text(original_text)
-                    else achievement_text
+                    None if is_unchanged else achievement_text
                 ),
                 "matched_requirements": [
                     match["requirement_id"]
-                    for match in paragraph_lookup[paragraph_id]["matched_requirements"]
+                    for match in paragraph_lookup[
+                        paragraph_id
+                    ]["matched_requirements"]
                     if "requirement_id" in match
                 ],
             }
+
         else:
             model_decisions[paragraph_id] = {
                 "source_paragraph_ids": [paragraph_id],
@@ -693,6 +931,10 @@ Do not add markdown or text outside the JSON object.
                 "rewritten_text": None,
                 "matched_requirements": [],
             }
+
+    # ---------------------------------------------------------
+    # 9. Build final paragraph decisions.
+    # ---------------------------------------------------------
 
     decisions = []
 
@@ -707,7 +949,10 @@ Do not add markdown or text outside the JSON object.
             or item["role"] == "project_content"
             or paragraph_id in achievement_id_set
         ):
-            decisions.append(model_decisions[paragraph_id])
+            decisions.append(
+                model_decisions[paragraph_id]
+            )
+
         else:
             decisions.append({
                 "source_paragraph_ids": [paragraph_id],
@@ -716,15 +961,24 @@ Do not add markdown or text outside the JSON object.
                 "rewritten_text": None,
                 "matched_requirements": [
                     match["requirement_id"]
-                    for match in paragraph_lookup[paragraph_id]["matched_requirements"]
+                    for match in paragraph_lookup[
+                        paragraph_id
+                    ]["matched_requirements"]
                     if "requirement_id" in match
                 ],
             })
 
+    # ---------------------------------------------------------
+    # 10. Validate final paragraph mapping.
+    # ---------------------------------------------------------
+
     expected_ids = {
         item["id"]
         for item in records
-        if item["id"] not in header_ids and item["id"] != profile_id
+        if (
+            item["id"] not in header_ids
+            and item["id"] != profile_id
+        )
     }
 
     returned_ids = [
@@ -737,7 +991,13 @@ Do not add markdown or text outside the JSON object.
         len(returned_ids) != len(set(returned_ids))
         or set(returned_ids) != expected_ids
     ):
-        raise ValueError("Internal resume decision validation failed.")
+        raise ValueError(
+            "Internal resume decision validation failed."
+        )
+
+    # ---------------------------------------------------------
+    # 11. Clean changes summary.
+    # ---------------------------------------------------------
 
     changes = response.get("changes_summary", [])
 
@@ -751,18 +1011,29 @@ Do not add markdown or text outside the JSON object.
     ][:8]
 
     logger.info(
-        "Resume tailoring complete. resume_id=%s source_paragraphs=%s "
-        "selected_projects=%s selected_achievements=%s experience_bullets=%s",
+        "Resume tailoring complete. resume_id=%s "
+        "source_paragraphs=%s selected_projects=%s "
+        "selected_achievements=%s experience_bullets=%s "
+        "removed_paragraphs=%s",
         resume_id,
         len(paragraphs),
-        len(selected_projects),
+        len(selected_project_ids),
         len(selected_achievements),
-        len(experience_ids),
+        len([
+            item
+            for item in experience_paragraphs
+            if item["role"] == "bullet"
+        ]),
+        sum(
+            1
+            for decision in decisions
+            if decision["action"] == "remove"
+        ),
     )
 
     return {
         "professional_summary": summary,
-        "selected_project_ids": selected_projects,
+        "selected_project_ids": selected_project_ids,
         "selected_achievement_ids": [
             item["source_paragraph_id"]
             for item in selected_achievements
